@@ -8,6 +8,7 @@ from workflow_engine.core import jobs
 from workflow_engine.core.states import JobStatus
 from workflow_engine.db.session import SessionFactory
 from workflow_engine.logging import get_logger
+from workflow_engine.metrics import JOBS_COMPLETED, LEASES_REAPED
 
 log = get_logger(__name__)
 
@@ -18,6 +19,9 @@ async def reap_expired(
     reaped = await jobs.reap_expired_leases(session_factory, batch_size)
     for item in reaped:
         log.warning("lease_reaped", job_id=str(item.job_id), new_status=item.status.value)
+        LEASES_REAPED.labels(item.status.value).inc()
+        if item.status != JobStatus.QUEUED:
+            JOBS_COMPLETED.labels(item.type, item.status.value).inc()
         if item.status == JobStatus.QUEUED:
             await jobs.enqueue_safely(dispatcher, item.job_id, item.priority)
     return Counter(item.status for item in reaped)

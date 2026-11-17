@@ -25,8 +25,12 @@ from workflow_engine.core.idempotency import IdempotencyRequest, request_hash
 from workflow_engine.core.states import JobStatus
 from workflow_engine.dispatch.rate_limit import TokenBucket
 from workflow_engine.handlers.registry import HandlerRegistry
+from workflow_engine.logging import get_logger
+from workflow_engine.metrics import JOBS_SUBMITTED, RATE_LIMITED
 
 router = APIRouter(prefix="/jobs", tags=["jobs"], dependencies=[Depends(require_api_key)])
+
+log = get_logger(__name__)
 
 MAX_LIST_LIMIT = 200
 SUBMIT_SCOPE = "submit"
@@ -44,6 +48,7 @@ async def enforce_submit_limit(
     limiter: TokenBucket = request.app.state.limiter
     decision = await limiter.acquire(SUBMIT_SCOPE, principal.key_id, settings.submit_rate_limit)
     if not decision.allowed:
+        RATE_LIMITED.labels("submission", "").inc()
         raise HTTPException(
             status_code=429,
             detail="submission rate limit exceeded for this API key",
@@ -94,7 +99,10 @@ async def create_job(
         idempotency=idem,
         idempotency_ttl=timedelta(hours=settings.idempotency_key_ttl_hours),
     )
-    if not result.created:
+    if result.created:
+        JOBS_SUBMITTED.labels(body.type, body.priority.value).inc()
+        log.info("job_submitted", job_id=str(result.job.id), job_type=body.type)
+    else:
         response.status_code = 200
     return JobOut.model_validate(result.job)
 

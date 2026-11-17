@@ -25,9 +25,13 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app alembic.ini ./
 COPY --chown=app:app migrations ./migrations
+# Owned by `app` so a fresh named volume mounted here inherits a writable model cache.
+RUN mkdir -p /app/.cache/fastembed && chown -R app:app /app/.cache
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/app/.cache/huggingface \
+    FASTEMBED_CACHE_DIR=/app/.cache/fastembed
 USER app
 EXPOSE 8000
 CMD ["python", "-m", "workflow_engine.api"]

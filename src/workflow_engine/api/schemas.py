@@ -106,3 +106,17 @@ class DeadLetterOut(BaseModel):
 class DeadLetterList(BaseModel):
     items: list[DeadLetterOut]
     next_cursor: str | None
+
+
+class SearchHitOut(BaseModel):
+    job_id: uuid.UUID
+    item_index: int
+    text: str
+    distance: float  # cosine distance, 0 = same direction
+    score: float  # cosine similarity, 1 - distance
+
+
+class SearchResponse(BaseModel):
+    query: str
+    model: str
+    results: list[SearchHitOut]

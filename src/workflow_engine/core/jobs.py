@@ -15,7 +15,7 @@ from sqlalchemy import delete, func, insert, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workflow_engine.core.idempotency import IdempotencyConflictError, IdempotencyRequest
-from workflow_engine.core.states import AttemptStatus, JobStatus, Priority
+from workflow_engine.core.states import ACTIVE_STATUSES, AttemptStatus, JobStatus, Priority
 from workflow_engine.db.models import DeadLetter, IdempotencyKey, Job, JobAttempt
 from workflow_engine.db.session import SessionFactory
 from workflow_engine.logging import get_logger
@@ -62,6 +62,7 @@ class Claim:
     payload: dict[str, Any]
     worker_id: str
     priority: Priority = Priority.NORMAL
+    created_at: datetime | None = None  # for end-to-end latency metrics
 
 
 class _ReplayError(Exception):
@@ -264,13 +265,14 @@ async def claim_job(
                     Job.type,
                     Job.payload,
                     Job.priority,
+                    Job.created_at,
                 )
                 .execution_options(synchronize_session=False)
             )
         ).one_or_none()
         if row is None:
             return None
-        lease_token, attempt, max_attempts, job_type, payload, priority = row
+        lease_token, attempt, max_attempts, job_type, payload, priority, created_at = row
         await session.execute(
             insert(JobAttempt).values(
                 job_id=job_id,
@@ -280,7 +282,17 @@ async def claim_job(
                 status=AttemptStatus.RUNNING,
             )
         )
-    return Claim(job_id, lease_token, attempt, max_attempts, job_type, payload, worker_id, priority)
+    return Claim(
+        job_id,
+        lease_token,
+        attempt,
+        max_attempts,
+        job_type,
+        payload,
+        worker_id,
+        priority,
+        created_at,
+    )
 
 
 def _fenced(claim: Claim) -> Any:
@@ -585,6 +597,7 @@ class Reaped:
     job_id: uuid.UUID
     priority: Priority
     status: JobStatus
+    type: str = ""
 
 
 LEASE_EXPIRED = "lease_expired"
@@ -602,6 +615,7 @@ async def reap_expired_leases(session_factory: SessionFactory, batch_size: int) 
             await session.execute(
                 select(
                     Job.id,
+                    Job.type,
                     Job.priority,
                     Job.lease_token,
                     Job.attempts,
@@ -615,7 +629,7 @@ async def reap_expired_leases(session_factory: SessionFactory, batch_size: int) 
             )
         ).all()
         reaped: list[Reaped] = []
-        for job_id, priority, token, attempts, max_attempts, cancel_requested in expired:
+        for job_id, job_type, priority, token, attempts, max_attempts, cancel_requested in expired:
             values: dict[str, Any] = {"last_error": LEASE_EXPIRED, **_RELEASE_LEASE}
             if cancel_requested:
                 status = JobStatus.CANCELLED
@@ -652,7 +666,7 @@ async def reap_expired_leases(session_factory: SessionFactory, batch_size: int) 
                         job_id=job_id, reason=LEASE_EXPIRED, last_error=LEASE_EXPIRED
                     )
                 )
-            reaped.append(Reaped(job_id, priority, status))
+            reaped.append(Reaped(job_id, priority, status, job_type))
     return reaped
 
 
@@ -730,3 +744,30 @@ async def idempotency_key_exists(session_factory: SessionFactory, idem: Idempote
             )
         )
     return found is not None
+
+
+# --------------------------------------------------------------------------- metrics
+
+
+async def active_job_counts(
+    session_factory: SessionFactory,
+) -> dict[tuple[JobStatus, Priority], int]:
+    """Non-terminal jobs by (status, priority); served by the partial index on status."""
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(Job.status, Job.priority, func.count())
+                .where(Job.status.in_(sorted(ACTIVE_STATUSES)))
+                .group_by(Job.status, Job.priority)
+            )
+        ).all()
+    return {(status, priority): count for status, priority, count in rows}
+
+
+async def dead_letter_count(session_factory: SessionFactory) -> int:
+    """Dead-letter entries that are still dead (not requeued)."""
+    async with session_factory() as session:
+        count = await session.scalar(
+            select(func.count()).select_from(DeadLetter).where(DeadLetter.requeued_at.is_(None))
+        )
+    return int(count or 0)

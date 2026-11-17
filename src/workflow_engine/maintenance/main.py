@@ -27,6 +27,8 @@ from workflow_engine.logging import configure_logging, get_logger
 from workflow_engine.maintenance.reaper import reap_expired
 from workflow_engine.maintenance.scheduler import promote_due_jobs
 from workflow_engine.maintenance.sweeper import sweep
+from workflow_engine.metrics import serve as serve_metrics
+from workflow_engine.telemetry import configure_tracing, instrument_clients, shutdown_tracing
 from workflow_engine.worker.shutdown import install_signal_handlers
 
 log = get_logger(__name__)
@@ -156,8 +158,15 @@ class Maintenance:
 
 
 async def run_maintenance(settings: Settings) -> None:
+    configure_tracing(settings, "maintenance")
     engine = create_engine(settings)
+    instrument_clients(settings, engine)
     redis = create_redis(settings)
+    metrics_server = (
+        await serve_metrics(settings.maintenance_metrics_port, "maintenance")
+        if settings.metrics_enabled
+        else None
+    )
     maintenance = Maintenance(
         settings=settings,
         session_factory=create_session_factory(engine),
@@ -169,8 +178,11 @@ async def run_maintenance(settings: Settings) -> None:
     try:
         await maintenance.run(stop)
     finally:
+        if metrics_server is not None:
+            metrics_server.close()
         await redis.aclose()
         await engine.dispose()
+        shutdown_tracing()
 
 
 def main() -> None:

@@ -80,15 +80,18 @@ class Settings(BaseSettings):
     submit_rate_limit_burst: int = Field(default=40, ge=1)
 
     # --- Embeddings ---
-    embed_search_max_k: int = 50
+    embed_search_max_k: int = Field(default=50, ge=1, le=1000)
     embed_model_name: str = "BAAI/bge-small-en-v1.5"
     embed_dim: int = 384
-    embed_batch_size: int = 32
+    embed_batch_size: int = Field(default=32, ge=1)
+    # ONNX Runtime threads per process; keeps several workers from oversubscribing the CPU.
+    embed_threads: int = Field(default=2, ge=1)
     fastembed_cache_dir: str = ".cache/fastembed"
 
     # --- Observability ---
     metrics_enabled: bool = True
-    worker_metrics_port: int = 9100
+    worker_metrics_port: int = Field(default=9100, ge=0, le=65535)
+    maintenance_metrics_port: int = Field(default=9101, ge=0, le=65535)
     otel_enabled: bool = False
     otel_service_name: str = "workflow-engine"
     otel_exporter_otlp_endpoint: str = "http://localhost:4318"

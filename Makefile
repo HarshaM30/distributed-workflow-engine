@@ -2,7 +2,7 @@ UV ?= uv
 COMPOSE ?= docker compose
 
 .DEFAULT_GOAL := help
-.PHONY: help install up down migrate api worker maintenance lint fmt typecheck \
+.PHONY: help install up down tracing-up migrate api worker maintenance lint fmt typecheck \
         test-unit test-integration test-chaos test bench
 
 help: ## List targets
@@ -15,7 +15,10 @@ up: ## Start Postgres + Redis and wait until healthy
 	$(COMPOSE) up -d --wait postgres redis
 
 down: ## Stop and remove containers (volumes are kept)
-	$(COMPOSE) --profile app down
+	$(COMPOSE) --profile app --profile tracing down
+
+tracing-up: ## Start Jaeger (UI on :16686); run processes with OTEL_ENABLED=true to export spans
+	$(COMPOSE) --profile tracing up -d jaeger
 
 migrate: ## Apply database migrations
 	$(UV) run alembic upgrade head

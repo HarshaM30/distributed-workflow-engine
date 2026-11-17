@@ -346,34 +346,73 @@ distributed-workflow-engine/
 ### Milestone 4: Observability and the ML job
 
 **Tasks**
-- [ ] structlog JSON output with `job_id`, `job_type`, `attempt`, `worker_id`, `trace_id`
+- [x] structlog JSON output with `job_id`, `job_type`, `attempt`, `worker_id`, `trace_id`
       bound in context, and a request-ID middleware on the API.
-- [ ] OpenTelemetry: FastAPI, SQLAlchemy, and Redis auto-instrumentation. Trace context is
+- [x] OpenTelemetry: FastAPI, SQLAlchemy, and Redis auto-instrumentation. Trace context is
       carried inside the stream message so a job's trace runs from the API through the
       worker. OTLP exporter goes to Jaeger all-in-one, behind a `tracing` compose profile.
-- [ ] Prometheus metrics: `jobs_submitted_total`, `jobs_completed_total{type,status}`,
+- [x] Prometheus metrics: `jobs_submitted_total`, `jobs_completed_total{type,status}`,
       `job_duration_seconds` histogram, `job_e2e_latency_seconds` histogram, `queue_depth`
       gauge, `retries_total`, `dlq_size`, `leases_reaped_total`, `sweeper_requeued_total`,
       `rate_limited_total`. API serves `/metrics`; workers serve it on `WORKER_METRICS_PORT`.
-- [ ] `embed_texts` handler: payload is a list of texts (with a cap), embedded in batches
+- [x] `embed_texts` handler: payload is a list of texts (with a cap), embedded in batches
       with fastembed `BAAI/bge-small-en-v1.5` (384 dimensions). Upserts on
       `(job_id, item_index)` so retries stay idempotent. Model is cached in a volume.
-- [ ] `GET /embeddings/search?q=&k=&job_id=`, which requires an API key. It embeds the
+- [x] `GET /embeddings/search?q=&k=&job_id=`, which requires an API key. It embeds the
       query with the same model and returns the top-k nearest stored texts by cosine
       distance, using the HNSW index. `k` is validated and capped, and `job_id` optionally
       limits the search to one job's texts. The model is loaded once per process, lazily.
 
 **Done when**
-- [ ] Every log line is valid JSON, and a single job's lines can be filtered by `job_id`.
-- [ ] Jaeger shows one trace that spans the API request, enqueue, worker claim, and handler.
-- [ ] `/metrics` scrapes cleanly and the counters move when jobs run.
-- [ ] An `embed_texts` job with 100 texts stores 100 vectors. Retrying it leaves the row
+- [x] Every log line is valid JSON, and a single job's lines can be filtered by `job_id`.
+- [x] Jaeger shows one trace that spans the API request, enqueue, worker claim, and handler.
+- [x] `/metrics` scrapes cleanly and the counters move when jobs run.
+- [x] An `embed_texts` job with 100 texts stores 100 vectors. Retrying it leaves the row
       count at 100.
-- [ ] `GET /embeddings/search` returns a semantically related text as the top hit for a
+- [x] `GET /embeddings/search` returns a semantically related text as the top hit for a
       paraphrased query (integration test with a small fixed corpus). EXPLAIN shows the
       HNSW index being used.
-- [ ] The worker image stays reasonably small with no PyTorch in the dependency tree
+- [x] The worker image stays reasonably small with no PyTorch in the dependency tree
       (verified with `uv tree`).
+
+**Implementation notes**
+- A tracer provider is always installed, so every process has trace IDs for its logs and the
+  API's trace context rides along in each stream entry (`traceparent`/`tracestate` fields).
+  Spans are only exported (OTLP/HTTP) when `OTEL_ENABLED=true`, and SQLAlchemy and Redis
+  auto-instrumentation is only switched on then. The SQLAlchemy instrumentor's declared range
+  stops below SQLAlchemy 2.1, so it is enabled with `skip_dep_check=True` (a test checks it
+  still emits `db.system=postgresql` spans).
+- Span chain: `POST /jobs` → `job.enqueue` → (stream) → `job.process` → `job.claim` and
+  `job.handler`. A hint re-sent later (scheduler, sweeper, reaper, shutdown release) carries the
+  sender's context, so a delayed or retried attempt starts its own trace rather than joining the
+  original request's.
+- stdlib loggers (uvicorn, alembic, libraries) render through the same structlog chain, so every
+  stdout line is JSON. The request-ID middleware echoes a safe `X-Request-ID` (else generates
+  one), binds `request_id`, and writes one `http_request` access line per request.
+- Workers and maintenance serve `/metrics` from a small asyncio server on their own event loop.
+  `prometheus_client.start_http_server` was dropped because its bind does a reverse-DNS lookup
+  (`getfqdn`) that stalled worker start-up for seconds on macOS. Port `0` disables the server, and
+  a taken port (several workers on one host) is logged rather than fatal. New setting:
+  `MAINTENANCE_METRICS_PORT`.
+- `queue_depth{status,priority}` and `dlq_size` are read from Postgres when the API is scraped.
+  `job_duration_seconds` is labelled by `type` and `outcome`; `rate_limited_total` by `limiter`
+  (`submission` or `execution`) and `type`. The reaper also counts its dead/cancelled outcomes
+  in `jobs_completed_total`.
+- `embed_texts` takes up to 512 texts of up to 4,000 characters (and the payload byte cap still
+  applies). It commits per batch and skips items already stored for the job, so a retry resumes
+  where the last attempt stopped. Handlers that write their own results get a session factory
+  on `JobContext`. Model loading and inference run in a thread so heartbeats keep going. New
+  setting: `EMBED_THREADS` (ONNX threads per process, default 2).
+- `GET /embeddings/search`: `k` outside `1..EMBED_SEARCH_MAX_K` gets 422. `hnsw.ef_search` is
+  raised to at least `k`, and a `job_id` filter turns on pgvector's iterative index scan so a
+  filter can't shrink the result below `k`. Each hit returns `distance` and `score = 1 - distance`.
+- The EXPLAIN test seeds 3,000 filler vectors first: on a near-empty table Postgres rightly picks
+  a sequential scan, at realistic sizes it picks the HNSW index (with or without `job_id`).
+- Compose: Jaeger 2.11 behind the `tracing` profile (`make tracing-up`, UI on :16686), a
+  `modelcache` volume shared by the API and workers, and 512 MB limits for both (the ONNX model
+  is loaded on first use). CI caches the model.
+- The image is 630 MB (the venv is 307 MB; ONNX Runtime is the largest package at 63 MB).
+  `uv tree` has no `torch`.
 
 ### Milestone 5: Benchmarks and chaos testing
 

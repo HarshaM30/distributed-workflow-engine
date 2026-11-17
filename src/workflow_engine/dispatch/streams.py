@@ -6,7 +6,7 @@ Stream entries are hints only: a worker must still win the CAS claim in Postgres
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from redis.asyncio import Redis
@@ -14,6 +14,7 @@ from redis.exceptions import ResponseError
 
 from workflow_engine.config import Settings
 from workflow_engine.core.states import PRIORITY_ORDER, Priority
+from workflow_engine.telemetry import TRACE_FIELDS, inject_trace_context, tracer
 
 
 def create_redis(settings: Settings) -> Redis:
@@ -35,6 +36,8 @@ class StreamMessage:
     stream: str
     message_id: str
     job_id: uuid.UUID | None  # None when the entry is malformed
+    # W3C trace context of whoever sent this hint (API request, scheduler, sweeper...).
+    trace_context: dict[str, str] = field(default_factory=dict)
 
 
 class StreamProducer:
@@ -44,12 +47,16 @@ class StreamProducer:
         self._maxlen = maxlen
 
     async def enqueue(self, job_id: uuid.UUID, priority: Priority) -> str:
-        message_id = await self._redis.xadd(
-            stream_name(self._prefix, priority),
-            {"job_id": str(job_id)},
-            maxlen=self._maxlen,
-            approximate=True,
-        )
+        stream = stream_name(self._prefix, priority)
+        with tracer().start_as_current_span(
+            "job.enqueue",
+            attributes={"job.id": str(job_id), "job.priority": priority.value, "stream": stream},
+        ):
+            # Injected inside the span, so the worker's spans become its children.
+            fields = {"job_id": str(job_id), **inject_trace_context()}
+            message_id = await self._redis.xadd(
+                stream, cast(Any, fields), maxlen=self._maxlen, approximate=True
+            )
         return str(message_id)
 
 
@@ -58,6 +65,11 @@ def _parse_job_id(fields: dict[str, Any]) -> uuid.UUID | None:
         return uuid.UUID(str(fields["job_id"]))
     except (KeyError, ValueError):
         return None
+
+
+def _message(stream: str, message_id: str, fields: dict[str, Any]) -> StreamMessage:
+    trace_context = {k: str(fields[k]) for k in TRACE_FIELDS if k in fields}
+    return StreamMessage(stream, message_id, _parse_job_id(fields), trace_context)
 
 
 class StreamConsumer:
@@ -100,7 +112,7 @@ class StreamConsumer:
         messages: list[StreamMessage] = []
         for stream, entries in response:
             for message_id, fields in entries:
-                messages.append(StreamMessage(stream, message_id, _parse_job_id(fields)))
+                messages.append(_message(stream, message_id, fields))
         messages.sort(key=lambda m: self.streams.index(m.stream))
         return messages
 
@@ -144,10 +156,7 @@ async def reclaim_idle(
             raise
         # Shape (Redis 7): [next_start, [(message_id, {field: value}), ...], [deleted_ids]]
         next_start, entries = cast(tuple[str, list[tuple[str, dict[str, Any] | None]]], raw[:2])
-        batch = [
-            StreamMessage(stream, message_id, _parse_job_id(fields or {}))
-            for message_id, fields in entries
-        ]
+        batch = [_message(stream, message_id, fields or {}) for message_id, fields in entries]
         if batch:
             await redis.xack(stream, group, *[m.message_id for m in batch])
             reclaimed.extend(batch)

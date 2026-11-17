@@ -70,5 +70,10 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
+      # The embedding model used by the embed_texts / search tests (~65 MB).
+      - uses: actions/cache@v4
+        with:
+          path: .cache/fastembed
+          key: fastembed-bge-small-en-v1.5
       - run: uv run alembic upgrade head
       - run: uv run pytest -m integration

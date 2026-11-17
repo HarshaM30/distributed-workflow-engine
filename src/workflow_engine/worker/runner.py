@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
+import time
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from pydantic import BaseModel, ValidationError
 from pydantic_core import to_jsonable_python
 from redis.exceptions import RedisError
@@ -21,6 +24,14 @@ from workflow_engine.dispatch.rate_limit import TokenBucket
 from workflow_engine.dispatch.streams import StreamConsumer, StreamMessage
 from workflow_engine.handlers.registry import HandlerRegistry, HandlerSpec, JobContext
 from workflow_engine.logging import get_logger
+from workflow_engine.metrics import (
+    JOB_DURATION,
+    JOB_E2E_LATENCY,
+    JOBS_COMPLETED,
+    RATE_LIMITED,
+    RETRIES,
+)
+from workflow_engine.telemetry import extract_trace_context, tracer
 from workflow_engine.worker.heartbeat import Interrupt, LeaseKeeper
 from workflow_engine.worker.shutdown import drain_deadline
 
@@ -100,24 +111,36 @@ class Worker:
             log.warning("malformed_stream_entry", message_id=message.message_id)
             await self.consumer.ack(message)
             return
-        claim = await jobs.claim_job(
-            self.session_factory,
-            message.job_id,
-            self.worker_id,
-            self.settings.worker_lease_seconds,
-        )
-        if claim is None:
-            # Stale or duplicate hint: Postgres says the job isn't queued.
-            log.debug("stale_message_dropped", job_id=str(message.job_id))
-            await self.consumer.ack(message)
-            return
-        with structlog.contextvars.bound_contextvars(
-            job_id=str(claim.job_id),
-            job_type=claim.type,
-            attempt=claim.attempt,
-            worker_id=self.worker_id,
-        ):
-            await self.execute(claim)
+        # The sender's trace (API request, scheduler, sweeper) becomes this span's parent.
+        with tracer().start_as_current_span(
+            "job.process",
+            context=extract_trace_context(message.trace_context),
+            kind=SpanKind.CONSUMER,
+            attributes={"job.id": str(message.job_id), "stream": message.stream},
+        ) as span:
+            with tracer().start_as_current_span("job.claim") as claim_span:
+                claim = await jobs.claim_job(
+                    self.session_factory,
+                    message.job_id,
+                    self.worker_id,
+                    self.settings.worker_lease_seconds,
+                )
+                claim_span.set_attribute("job.claimed", claim is not None)
+            if claim is None:
+                # Stale or duplicate hint: Postgres says the job isn't queued.
+                log.debug("stale_message_dropped", job_id=str(message.job_id))
+                await self.consumer.ack(message)
+                return
+            span.set_attributes(
+                {"job.type": claim.type, "job.attempt": claim.attempt, "worker.id": self.worker_id}
+            )
+            with structlog.contextvars.bound_contextvars(
+                job_id=str(claim.job_id),
+                job_type=claim.type,
+                attempt=claim.attempt,
+                worker_id=self.worker_id,
+            ):
+                await self.execute(claim)
         await self.consumer.ack(message)
 
     # ------------------------------------------------------------------ execution
@@ -136,7 +159,12 @@ class Worker:
             await self._fail(claim, error, retryable=False)
             return
 
-        ctx = JobContext(job_id=claim.job_id, attempt=claim.attempt, worker_id=self.worker_id)
+        ctx = JobContext(
+            job_id=claim.job_id,
+            attempt=claim.attempt,
+            worker_id=self.worker_id,
+            session_factory=self.session_factory,
+        )
         log.info("job_started")
         handler: asyncio.Task[Any] = asyncio.create_task(self._invoke(spec, payload, ctx))
         keeper = LeaseKeeper(
@@ -145,6 +173,7 @@ class Worker:
             lease_seconds=self.settings.worker_lease_seconds,
             interval=self.settings.worker_heartbeat_seconds,
         )
+        started = time.perf_counter()
         keeper_task = asyncio.create_task(keeper.run(handler))
         deadline = asyncio.create_task(
             drain_deadline(self._stop, self.settings.worker_shutdown_grace_seconds)
@@ -159,11 +188,20 @@ class Worker:
             deadline.cancel()
             keeper.stop()
             await keeper_task
-        await self._finalize(claim, handler, keeper.interrupt, spec)
+        outcome = await self._finalize(claim, handler, keeper.interrupt, spec)
+        JOB_DURATION.labels(claim.type, outcome).observe(time.perf_counter() - started)
 
     @staticmethod
     async def _invoke(spec: HandlerSpec, payload: BaseModel, ctx: JobContext) -> Any:
-        return await asyncio.wait_for(spec.func(payload, ctx), timeout=spec.timeout_seconds)
+        # Runs in its own task, which inherits the job.process span as its parent.
+        with tracer().start_as_current_span(
+            "job.handler", attributes={"job.type": spec.name}
+        ) as span:
+            try:
+                return await asyncio.wait_for(spec.func(payload, ctx), timeout=spec.timeout_seconds)
+            except Exception as exc:
+                span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                raise
 
     async def _finalize(
         self,
@@ -171,37 +209,44 @@ class Worker:
         handler: asyncio.Task[Any],
         interrupt: Interrupt | None,
         spec: HandlerSpec,
-    ) -> None:
+    ) -> str:
+        """Write the attempt's outcome; returns a label for the duration histogram."""
         if handler.cancelled():
-            await self._interrupted(claim, interrupt)
-            return
+            return await self._interrupted(claim, interrupt)
         exc = handler.exception()
         if exc is None:
             if await jobs.complete_job(
                 self.session_factory, claim, to_jsonable_python(handler.result())
             ):
                 log.info("job_succeeded")
-            else:
-                log.warning("completion_fenced_out")
-            return
+                JOBS_COMPLETED.labels(claim.type, JobStatus.SUCCEEDED.value).inc()
+                if claim.created_at is not None:
+                    e2e = (datetime.now(UTC) - claim.created_at).total_seconds()
+                    JOB_E2E_LATENCY.labels(claim.type).observe(max(e2e, 0.0))
+                return "succeeded"
+            log.warning("completion_fenced_out")
+            return "fenced_out"
         if isinstance(exc, TimeoutError):
             error = f"timed out after {spec.timeout_seconds:g}s"
         else:
             error = f"{type(exc).__name__}: {exc}"
         await self._fail(claim, error, retryable=True)
+        return "failed"
 
-    async def _interrupted(self, claim: jobs.Claim, interrupt: Interrupt | None) -> None:
+    async def _interrupted(self, claim: jobs.Claim, interrupt: Interrupt | None) -> str:
         if interrupt == Interrupt.CANCEL_REQUESTED:
             if await jobs.cancel_running_job(self.session_factory, claim):
                 log.info("job_cancelled")
-            return
+                JOBS_COMPLETED.labels(claim.type, JobStatus.CANCELLED.value).inc()
+            return "cancelled"
         if interrupt == Interrupt.LEASE_LOST:
-            return  # someone else owns the job now; there's nothing left to write
+            return "lease_lost"  # someone else owns the job now; there's nothing left to write
         # Shutdown (or an unexpected cancellation): hand the job back rather than abandon it.
         if await jobs.release_job(self.session_factory, claim):
             log.info("job_released")
             if self.dispatcher is not None:
                 await jobs.enqueue_safely(self.dispatcher, claim.job_id, claim.priority)
+        return "released"
 
     async def _fail(self, claim: jobs.Claim, error: str, *, retryable: bool) -> None:
         delay = backoff_delay(
@@ -216,8 +261,10 @@ class Worker:
             log.warning("failure_fenced_out", error=error)
         elif status == JobStatus.PENDING:
             log.warning("job_retry_scheduled", error=error, retry_in_seconds=round(delay, 3))
+            RETRIES.labels(claim.type).inc()
         else:
             log.warning("job_dead", error=error, retryable=retryable)
+            JOBS_COMPLETED.labels(claim.type, JobStatus.DEAD.value).inc()
 
     async def _throttled(self, claim: jobs.Claim) -> bool:
         """Execution throttle: an empty bucket defers the job to `pending`, never rejects it."""
@@ -231,4 +278,5 @@ class Worker:
         delay = decision.retry_after * (1 + random.random())  # noqa: S311
         if await jobs.defer_job(self.session_factory, claim, delay):
             log.info("job_throttled", retry_in_seconds=round(delay, 3))
+            RATE_LIMITED.labels("execution", claim.type).inc()
         return True

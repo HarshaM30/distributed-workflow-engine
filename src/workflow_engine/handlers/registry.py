@@ -9,6 +9,8 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from workflow_engine.db.session import SessionFactory
+
 DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
@@ -17,6 +19,8 @@ class JobContext:
     job_id: uuid.UUID
     attempt: int
     worker_id: str
+    # For handlers that write their own results (e.g. embed_texts upserts vectors).
+    session_factory: SessionFactory | None = None
 
 
 HandlerFunc = Callable[[Any, JobContext], Awaitable[Any]]
@@ -88,6 +92,6 @@ handler = default_registry.register
 
 def load_builtin_handlers() -> HandlerRegistry:
     """Import the built-in handler modules (registration happens on import)."""
-    from workflow_engine.handlers import cpu, flaky, sleep  # noqa: F401
+    from workflow_engine.handlers import cpu, embed_texts, flaky, sleep  # noqa: F401
 
     return default_registry

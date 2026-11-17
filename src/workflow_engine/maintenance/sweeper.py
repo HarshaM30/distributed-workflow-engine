@@ -17,6 +17,7 @@ from workflow_engine.core import jobs
 from workflow_engine.db.session import SessionFactory
 from workflow_engine.dispatch.streams import reclaim_idle
 from workflow_engine.logging import get_logger
+from workflow_engine.metrics import SWEEPER_REQUEUED
 
 log = get_logger(__name__)
 
@@ -56,6 +57,7 @@ async def sweep(
     for item in resend.values():
         await jobs.enqueue_safely(dispatcher, item.job_id, item.priority)
     keys_deleted = await jobs.delete_expired_idempotency_keys(session_factory, batch_size)
+    SWEEPER_REQUEUED.inc(len(resend))
     if resend or reclaimed:
         log.info("sweeper_repaired", requeued=len(resend), reclaimed=reclaimed)
     return SweepResult(requeued=len(resend), reclaimed=reclaimed, keys_deleted=keys_deleted)

@@ -12,6 +12,8 @@ from workflow_engine.dispatch.rate_limit import TokenBucket
 from workflow_engine.dispatch.streams import StreamConsumer, StreamProducer, create_redis
 from workflow_engine.handlers.registry import load_builtin_handlers
 from workflow_engine.logging import configure_logging
+from workflow_engine.metrics import serve as serve_metrics
+from workflow_engine.telemetry import configure_tracing, instrument_clients, shutdown_tracing
 from workflow_engine.worker.runner import Worker
 from workflow_engine.worker.shutdown import install_signal_handlers
 
@@ -21,8 +23,15 @@ def default_worker_id() -> str:
 
 
 async def run_worker(settings: Settings) -> None:
+    configure_tracing(settings, "worker")
     engine = create_engine(settings)
+    instrument_clients(settings, engine)
     redis = create_redis(settings)
+    metrics_server = (
+        await serve_metrics(settings.worker_metrics_port, "worker")
+        if settings.metrics_enabled
+        else None
+    )
     worker_id = settings.worker_id or default_worker_id()
     worker = Worker(
         settings=settings,
@@ -40,8 +49,11 @@ async def run_worker(settings: Settings) -> None:
     try:
         await worker.run(stop)
     finally:
+        if metrics_server is not None:
+            metrics_server.close()
         await redis.aclose()
         await engine.dispose()
+        shutdown_tracing()
 
 
 def main() -> None:
