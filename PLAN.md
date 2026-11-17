@@ -247,57 +247,101 @@ distributed-workflow-engine/
 ### Milestone 3: Reliability
 
 **Tasks**
-- [ ] Retries: on failure, set `run_at = now + backoff(attempt)` using full jitter capped at
+- [x] Retries: on failure, set `run_at = now + backoff(attempt)` using full jitter capped at
       `RETRY_MAX_DELAY_SECONDS`, and set status to `pending`. `max_attempts` comes from the
       job, falling back to the handler default and then the global default.
-- [ ] Dead-lettering: when attempts run out, set status to `dead` and insert a
+- [x] Dead-lettering: when attempts run out, set status to `dead` and insert a
       `dead_letters` row in the same transaction.
-- [ ] `GET /dlq` (paginated) and `POST /dlq/{id}/requeue`, which resets attempts, sets
+- [x] `GET /dlq` (paginated) and `POST /dlq/{id}/requeue`, which resets attempts, sets
       `requeued_at`, and re-enqueues the job.
-- [ ] Leases: claim sets `lease_expires_at`, a heartbeat task renews it every
+- [x] Leases: claim sets `lease_expires_at`, a heartbeat task renews it every
       `WORKER_HEARTBEAT_SECONDS`, and every write checks the fencing token.
-- [ ] Reaper: `running` jobs with an expired lease go back to `queued` (counted as a failed
+- [x] Reaper: `running` jobs with an expired lease go back to `queued` (counted as a failed
       attempt with error `lease_expired`), or to `dead` if attempts are exhausted. Uses
       `FOR UPDATE SKIP LOCKED`.
-- [ ] Sweeper: `queued` jobs older than a threshold get re-XADDed. This is safe because of
+- [x] Sweeper: `queued` jobs older than a threshold get re-XADDed. This is safe because of
       the CAS claim. Also uses XAUTOCLAIM to clean up stale pending-entry-list entries.
-- [ ] Scheduler: due `pending` jobs move to `queued` and get XADDed, in batches.
-- [ ] Maintenance process with Postgres advisory-lock leader election.
-- [ ] Graceful shutdown: on SIGTERM, stop reading new messages, let in-flight jobs finish
+- [x] Scheduler: due `pending` jobs move to `queued` and get XADDed, in batches.
+- [x] Maintenance process with Postgres advisory-lock leader election.
+- [x] Graceful shutdown: on SIGTERM, stop reading new messages, let in-flight jobs finish
       within the grace period, and if a job is still running after that, release its lease
       (back to `queued`) instead of abandoning it.
-- [ ] Priorities: workers poll `high`, then `normal`, then `low`.
-- [ ] Delayed jobs: `run_at` on submission.
-- [ ] Cancellation via `POST /jobs/{id}/cancel`. A `pending` or `queued` job becomes
+- [x] Priorities: workers poll `high`, then `normal`, then `low`.
+- [x] Delayed jobs: `run_at` on submission.
+- [x] Cancellation via `POST /jobs/{id}/cancel`. A `pending` or `queued` job becomes
       `cancelled` immediately. A `running` job gets `cancel_requested` set, the heartbeat
       sees it and cancels the handler task, and the final state is `cancelled`. Terminal
       jobs return 409.
-- [ ] Token-bucket Lua script shared by both limiters.
-- [ ] Execution throttle per job type (configured by `RATE_LIMITS`). An empty bucket
+- [x] Token-bucket Lua script shared by both limiters.
+- [x] Execution throttle per job type (configured by `RATE_LIMITS`). An empty bucket
       delays the job and never rejects it.
-- [ ] Submission limit per client on `POST /jobs`, keyed by API key (configured by
+- [x] Submission limit per client on `POST /jobs`, keyed by API key (configured by
       `SUBMIT_RATE_LIMIT_PER_SECOND` / `SUBMIT_RATE_LIMIT_BURST`). Returns 429 with
       `Retry-After`, and idempotent replays are exempt.
 
 **Done when**
-- [ ] A `flaky` job with p=1.0 and max_attempts=3 ends up `dead` with exactly 3 attempts.
+- [x] A `flaky` job with p=1.0 and max_attempts=3 ends up `dead` with exactly 3 attempts.
       Attempt timestamps show growing, jittered gaps.
-- [ ] A requeued DLQ job runs again and can succeed.
-- [ ] After `kill -9` on a worker mid-job, the job is reaped and completed by another worker
+- [x] A requeued DLQ job runs again and can succeed.
+- [x] After `kill -9` on a worker mid-job, the job is reaped and completed by another worker
       within lease time plus the reaper interval.
-- [ ] A zombie worker's late completion is rejected by the fencing token (integration test).
-- [ ] After `FLUSHALL` on Redis, every non-terminal job still completes thanks to the
+- [x] A zombie worker's late completion is rejected by the fencing token (integration test).
+- [x] After `FLUSHALL` on Redis, every non-terminal job still completes thanks to the
       sweeper (integration test).
-- [ ] After SIGTERM, an in-flight 5-second sleep job finishes and the worker exits 0.
-- [ ] With a mixed backlog, high-priority jobs start before low-priority ones.
-- [ ] A job with `run_at` 10s in the future doesn't start before then.
-- [ ] Cancel works in each state (pending, queued, running, terminal) and each case is
+- [x] After SIGTERM, an in-flight 5-second sleep job finishes and the worker exits 0.
+- [x] With a mixed backlog, high-priority jobs start before low-priority ones.
+- [x] A job with `run_at` 10s in the future doesn't start before then.
+- [x] Cancel works in each state (pending, queued, running, terminal) and each case is
       tested.
-- [ ] An execution limit of 5/s on a type caps execution starts at roughly 5/s, within
+- [x] An execution limit of 5/s on a type caps execution starts at roughly 5/s, within
       tolerance, and every throttled job still completes.
-- [ ] A client that goes over its submission limit gets 429 with a valid `Retry-After`.
+- [x] A client that goes over its submission limit gets 429 with a valid `Retry-After`.
       Other API keys aren't affected, and replaying an existing Idempotency-Key still
       returns 200.
+
+**Implementation notes**
+- Backoff is full jitter, so each gap is a random draw from a window whose ceiling doubles
+  (`base * 2**(n-1)`, capped). Gaps grow in their upper bound and on average, not on every
+  single run. The integration test checks each gap against its window; a unit test checks
+  that the mean grows.
+- Exhausted retries dead-letter with reason `failed`; an expired lease with no attempts left
+  uses `lease_expired`. An unknown job type or a payload that no longer validates goes
+  straight to `dead` with reason `non_retryable` (retrying can't help).
+- `POST /dlq/{id}/requeue` takes the dead-letter entry id. `GET /dlq` hides requeued entries
+  unless `include_requeued=true`, and pages newest first by id. Requeuing twice returns 409.
+- `POST /jobs/{id}/cancel` returns 200 when the job is cancelled at once (pending/queued),
+  202 when it is running and only `cancel_requested` is set, 404 and 409 otherwise. A
+  running job stops within one heartbeat interval. The reaper also honours a pending cancel:
+  an expired lease on a job with `cancel_requested` ends in `cancelled`.
+- The heartbeat also detects a lost lease and cancels the handler, so the worker stops
+  wasting time on a job someone else now owns.
+- On shutdown, a job released after the grace period goes back to `queued` with its attempt
+  marked `released` and *not counted* (`attempts` is decremented). It is XADDed right away,
+  so the next worker doesn't wait for the sweeper. Its next attempt reuses the attempt number.
+- The execution throttle is checked after the claim (that is when the type is known). A
+  throttled claim is undone: the job returns to `pending` with `run_at = now + retry_after`
+  (plus jitter), `attempts` is decremented, and the attempt row is deleted, since the handler
+  never ran.
+- Before charging the submission limit, the API checks for a live Idempotency-Key, so a replay
+  is free. Concurrent first-time duplicates may each use a token. Invalid requests (422) are
+  rejected before the limiter and use no tokens.
+- The sweeper finds "stale" queued jobs by `updated_at` older than `SWEEPER_STALE_SECONDS`, and
+  bumps `updated_at` when it re-sends, so each job gets at most one extra hint per window and
+  a large backlog doesn't flood the streams. XAUTOCLAIM uses the same idle threshold: reclaimed
+  entries are ACKed, and any whose job is still `queued` is re-sent. The sweeper also deletes
+  expired idempotency keys.
+- Leader election uses `pg_try_advisory_lock` on a dedicated unpooled connection, which is
+  checked every 2s. Losing that connection makes the leader step down, and a standby retries
+  every `MAINTENANCE_LEADER_RETRY_SECONDS`.
+- New settings: `SWEEPER_STALE_SECONDS`, `MAINTENANCE_BATCH_SIZE`,
+  `MAINTENANCE_LEADER_RETRY_SECONDS`. Lease, heartbeat, and grace timings are now floats, and
+  config rejects a heartbeat interval that isn't shorter than the lease.
+- The Redis-wipe test runs `FLUSHDB` on the test database (DB 15) instead of `FLUSHALL`, so it
+  can't wipe a developer's local Redis data. The effect on the engine is the same: streams,
+  groups, and PELs are all gone.
+- The kill -9 and SIGTERM checks run real worker subprocesses inside the integration suite.
+  The Docker-based chaos harness is still Milestone 5.
+- `docker-compose.yml` gains a `maintenance` service under the `app` profile.
 
 ### Milestone 4: Observability and the ML job
 

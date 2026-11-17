@@ -8,7 +8,8 @@ import socket
 
 from workflow_engine.config import Settings, get_settings
 from workflow_engine.db.session import create_engine, create_session_factory
-from workflow_engine.dispatch.streams import StreamConsumer, create_redis
+from workflow_engine.dispatch.rate_limit import TokenBucket
+from workflow_engine.dispatch.streams import StreamConsumer, StreamProducer, create_redis
 from workflow_engine.handlers.registry import load_builtin_handlers
 from workflow_engine.logging import configure_logging
 from workflow_engine.worker.runner import Worker
@@ -31,6 +32,8 @@ async def run_worker(settings: Settings) -> None:
         ),
         registry=load_builtin_handlers(),
         worker_id=worker_id,
+        dispatcher=StreamProducer(redis, settings.redis_stream_prefix, settings.stream_maxlen),
+        limiter=TokenBucket(redis, settings.redis_stream_prefix),
     )
     stop = asyncio.Event()
     install_signal_handlers(stop)

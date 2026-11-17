@@ -79,10 +79,13 @@ async def test_duplicate_stream_entries_run_handler_once(
     assert await _pending_count(running_worker, test_settings) == 0
 
 
-async def test_failure_dead_letters_the_job(
+async def test_failure_with_one_attempt_dead_letters_the_job(
     client: httpx.AsyncClient, app: FastAPI, running_worker: Worker
 ) -> None:
-    job_id = await _submit(client, fail=True)
+    resp = await client.post(
+        "/jobs", json={"type": "count", "payload": {"fail": True}, "max_attempts": 1}
+    )
+    job_id = resp.json()["id"]
     job = await wait_for_status(client, job_id, {"dead"})
     assert job["last_error"] == "RuntimeError: asked to fail"
     (attempt,) = job["attempt_history"]
@@ -96,7 +99,10 @@ async def test_failure_dead_letters_the_job(
 async def test_handler_timeout_fails_the_job(
     client: httpx.AsyncClient, running_worker: Worker
 ) -> None:
-    job_id = await _submit(client, seconds=5)  # `count` has a 2s timeout
+    resp = await client.post(
+        "/jobs", json={"type": "count", "payload": {"seconds": 5}, "max_attempts": 1}
+    )
+    job_id = resp.json()["id"]  # `count` has a 2s timeout
     job = await wait_for_status(client, job_id, {"dead", "succeeded"}, within=10)
     assert job["status"] == "dead"
     assert job["last_error"] == "timed out after 2s"
@@ -113,7 +119,8 @@ async def test_stale_lease_token_cannot_overwrite_result(
 
     stale = jobs.Claim(**{**claim.__dict__, "lease_token": claim.lease_token - 1})
     assert await jobs.complete_job(sf, stale, {"from": "zombie"}) is False
-    assert await jobs.fail_job(sf, stale, "zombie error") is False
+    assert await jobs.fail_job(sf, stale, "zombie error", retry_delay=0) is None
+    assert await jobs.heartbeat(sf, stale, 30) is None
     assert await jobs.complete_job(sf, claim, {"from": "owner"}) is True
     assert await jobs.complete_job(sf, claim, {"again": True}) is False  # already terminal
 

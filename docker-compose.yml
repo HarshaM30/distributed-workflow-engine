@@ -97,6 +97,15 @@ services:
     stop_grace_period: 40s
     mem_limit: 256m
 
+  # Scheduler, reaper, and sweeper. Extra replicas are safe: they wait on the leader lock.
+  maintenance:
+    <<: *app
+    command: ["python", "-m", "workflow_engine.maintenance"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 192m
+
 volumes:
   pgdata:
   redisdata:

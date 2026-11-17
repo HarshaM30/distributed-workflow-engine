@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -51,19 +51,24 @@ class Settings(BaseSettings):
     # --- Worker ---
     worker_concurrency: int = Field(default=1, ge=1)
     worker_id: str | None = None
-    worker_lease_seconds: int = Field(default=30, gt=0)
-    worker_heartbeat_seconds: int = Field(default=10, gt=0)
-    worker_shutdown_grace_seconds: int = Field(default=30, ge=0)
+    worker_lease_seconds: float = Field(default=30, gt=0)
+    worker_heartbeat_seconds: float = Field(default=10, gt=0)
+    worker_shutdown_grace_seconds: float = Field(default=30, ge=0)
     worker_block_ms: int = Field(default=2000, gt=0)
 
     # --- Maintenance loops ---
-    reaper_interval_seconds: float = 5
-    sweeper_interval_seconds: float = 15
-    scheduler_interval_seconds: float = 1
+    reaper_interval_seconds: float = Field(default=5, gt=0)
+    sweeper_interval_seconds: float = Field(default=15, gt=0)
+    scheduler_interval_seconds: float = Field(default=1, gt=0)
+    # A queued job untouched for this long is re-XADDed; PEL entries idle this long are reclaimed.
+    sweeper_stale_seconds: float = Field(default=30, gt=0)
+    maintenance_batch_size: int = Field(default=500, ge=1)
+    # How often a standby maintenance process retries the leader lock.
+    maintenance_leader_retry_seconds: float = Field(default=5, gt=0)
 
     # --- Retries ---
-    retry_base_delay_seconds: float = 1
-    retry_max_delay_seconds: float = 300
+    retry_base_delay_seconds: float = Field(default=1, ge=0)
+    retry_max_delay_seconds: float = Field(default=300, ge=0)
     default_max_attempts: int = Field(default=5, ge=1)
 
     # --- Idempotency ---
@@ -71,8 +76,8 @@ class Settings(BaseSettings):
 
     # --- Rate limiting ---
     rate_limits: dict[str, RateLimit] = Field(default_factory=dict)
-    submit_rate_limit_per_second: float = 20
-    submit_rate_limit_burst: int = 40
+    submit_rate_limit_per_second: float = Field(default=20, gt=0)
+    submit_rate_limit_burst: int = Field(default=40, ge=1)
 
     # --- Embeddings ---
     embed_search_max_k: int = 50
@@ -101,6 +106,16 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _heartbeat_inside_lease(self) -> Settings:
+        if self.worker_heartbeat_seconds >= self.worker_lease_seconds:
+            raise ValueError("WORKER_HEARTBEAT_SECONDS must be smaller than WORKER_LEASE_SECONDS")
+        return self
+
+    @property
+    def submit_rate_limit(self) -> RateLimit:
+        return RateLimit(rate=self.submit_rate_limit_per_second, burst=self.submit_rate_limit_burst)
 
     @property
     def sqlalchemy_url(self) -> str:

@@ -26,7 +26,7 @@ api: ## Run the HTTP API
 worker: ## Run one worker process
 	$(UV) run python -m workflow_engine.worker
 
-maintenance: ## Run the maintenance process (scheduler, reaper, sweeper)
+maintenance: ## Run the maintenance process (scheduler, reaper, sweeper; leader-elected)
 	$(UV) run python -m workflow_engine.maintenance
 
 lint: ## ruff check + format check + mypy --strict

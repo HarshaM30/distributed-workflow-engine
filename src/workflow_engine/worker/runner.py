@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
+from typing import Any
 
 import structlog
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from pydantic_core import to_jsonable_python
 from redis.exceptions import RedisError
 
 from workflow_engine.config import Settings
 from workflow_engine.core import jobs
+from workflow_engine.core.backoff import backoff_delay
+from workflow_engine.core.states import JobStatus
 from workflow_engine.db.session import SessionFactory
+from workflow_engine.dispatch.rate_limit import TokenBucket
 from workflow_engine.dispatch.streams import StreamConsumer, StreamMessage
-from workflow_engine.handlers.registry import HandlerRegistry, JobContext
+from workflow_engine.handlers.registry import HandlerRegistry, HandlerSpec, JobContext
 from workflow_engine.logging import get_logger
+from workflow_engine.worker.heartbeat import Interrupt, LeaseKeeper
+from workflow_engine.worker.shutdown import drain_deadline
 
 log = get_logger(__name__)
 
 READ_ERROR_BACKOFF_SECONDS = 1.0
+EXECUTION_SCOPE = "exec"
 
 
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
@@ -36,12 +44,19 @@ class Worker:
         consumer: StreamConsumer,
         registry: HandlerRegistry,
         worker_id: str,
+        dispatcher: jobs.Dispatcher | None = None,
+        limiter: TokenBucket | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.consumer = consumer
         self.registry = registry
         self.worker_id = worker_id
+        # Re-sends released jobs right away; without it the sweeper picks them up later.
+        self.dispatcher = dispatcher
+        # Execution throttle; None disables it.
+        self.limiter = limiter
+        self._stop = asyncio.Event()
 
     async def start(self) -> None:
         """Create the consumer groups, retrying until Redis is reachable."""
@@ -54,6 +69,7 @@ class Worker:
                 await asyncio.sleep(READ_ERROR_BACKOFF_SECONDS)
 
     async def run(self, stop: asyncio.Event) -> None:
+        self._stop = stop
         await self.start()
         log.info("worker_started", worker_id=self.worker_id)
         async with asyncio.TaskGroup() as tg:
@@ -70,7 +86,8 @@ class Worker:
                 await _sleep_or_stop(stop, READ_ERROR_BACKOFF_SECONDS)
                 continue
             for message in messages:
-                # Messages already read are finished even if stop was requested meanwhile.
+                # Messages already read are processed even if stop was requested meanwhile;
+                # the drain deadline still bounds how long that takes.
                 try:
                     await self.process_message(message)
                 except Exception:
@@ -103,33 +120,115 @@ class Worker:
             await self.execute(claim)
         await self.consumer.ack(message)
 
+    # ------------------------------------------------------------------ execution
+
     async def execute(self, claim: jobs.Claim) -> None:
         spec = self.registry.get(claim.type)
         if spec is None:
-            await jobs.fail_job(
-                self.session_factory, claim, f"no handler registered for {claim.type!r}"
-            )
-            log.error("job_failed", reason="unknown_type")
+            await self._fail(claim, f"no handler registered for {claim.type!r}", retryable=False)
             return
-        ctx = JobContext(job_id=claim.job_id, attempt=claim.attempt, worker_id=self.worker_id)
-        log.info("job_started")
+        if await self._throttled(claim):
+            return
         try:
             payload = spec.payload_model.model_validate(claim.payload)
-            raw = await asyncio.wait_for(spec.func(payload, ctx), timeout=spec.timeout_seconds)
-            result = to_jsonable_python(raw)
-        except TimeoutError:
-            error = f"timed out after {spec.timeout_seconds:g}s"
         except ValidationError as exc:
             error = f"invalid payload: {exc.error_count()} error(s)"
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        else:
-            if await jobs.complete_job(self.session_factory, claim, result):
+            await self._fail(claim, error, retryable=False)
+            return
+
+        ctx = JobContext(job_id=claim.job_id, attempt=claim.attempt, worker_id=self.worker_id)
+        log.info("job_started")
+        handler: asyncio.Task[Any] = asyncio.create_task(self._invoke(spec, payload, ctx))
+        keeper = LeaseKeeper(
+            self.session_factory,
+            claim,
+            lease_seconds=self.settings.worker_lease_seconds,
+            interval=self.settings.worker_heartbeat_seconds,
+        )
+        keeper_task = asyncio.create_task(keeper.run(handler))
+        deadline = asyncio.create_task(
+            drain_deadline(self._stop, self.settings.worker_shutdown_grace_seconds)
+        )
+        try:
+            await asyncio.wait({handler, deadline}, return_when=asyncio.FIRST_COMPLETED)
+            if not handler.done():
+                log.warning("drain_deadline_reached")
+                keeper.interrupt_handler(handler, Interrupt.SHUTDOWN)
+            await asyncio.wait({handler})
+        finally:
+            deadline.cancel()
+            keeper.stop()
+            await keeper_task
+        await self._finalize(claim, handler, keeper.interrupt, spec)
+
+    @staticmethod
+    async def _invoke(spec: HandlerSpec, payload: BaseModel, ctx: JobContext) -> Any:
+        return await asyncio.wait_for(spec.func(payload, ctx), timeout=spec.timeout_seconds)
+
+    async def _finalize(
+        self,
+        claim: jobs.Claim,
+        handler: asyncio.Task[Any],
+        interrupt: Interrupt | None,
+        spec: HandlerSpec,
+    ) -> None:
+        if handler.cancelled():
+            await self._interrupted(claim, interrupt)
+            return
+        exc = handler.exception()
+        if exc is None:
+            if await jobs.complete_job(
+                self.session_factory, claim, to_jsonable_python(handler.result())
+            ):
                 log.info("job_succeeded")
             else:
                 log.warning("completion_fenced_out")
             return
-        if await jobs.fail_job(self.session_factory, claim, error):
-            log.warning("job_failed", error=error)
+        if isinstance(exc, TimeoutError):
+            error = f"timed out after {spec.timeout_seconds:g}s"
         else:
+            error = f"{type(exc).__name__}: {exc}"
+        await self._fail(claim, error, retryable=True)
+
+    async def _interrupted(self, claim: jobs.Claim, interrupt: Interrupt | None) -> None:
+        if interrupt == Interrupt.CANCEL_REQUESTED:
+            if await jobs.cancel_running_job(self.session_factory, claim):
+                log.info("job_cancelled")
+            return
+        if interrupt == Interrupt.LEASE_LOST:
+            return  # someone else owns the job now; there's nothing left to write
+        # Shutdown (or an unexpected cancellation): hand the job back rather than abandon it.
+        if await jobs.release_job(self.session_factory, claim):
+            log.info("job_released")
+            if self.dispatcher is not None:
+                await jobs.enqueue_safely(self.dispatcher, claim.job_id, claim.priority)
+
+    async def _fail(self, claim: jobs.Claim, error: str, *, retryable: bool) -> None:
+        delay = backoff_delay(
+            claim.attempt,
+            self.settings.retry_base_delay_seconds,
+            self.settings.retry_max_delay_seconds,
+        )
+        status = await jobs.fail_job(
+            self.session_factory, claim, error, retry_delay=delay, retryable=retryable
+        )
+        if status is None:
             log.warning("failure_fenced_out", error=error)
+        elif status == JobStatus.PENDING:
+            log.warning("job_retry_scheduled", error=error, retry_in_seconds=round(delay, 3))
+        else:
+            log.warning("job_dead", error=error, retryable=retryable)
+
+    async def _throttled(self, claim: jobs.Claim) -> bool:
+        """Execution throttle: an empty bucket defers the job to `pending`, never rejects it."""
+        limit = self.settings.rate_limits.get(claim.type)
+        if limit is None or self.limiter is None:
+            return False
+        decision = await self.limiter.acquire(EXECUTION_SCOPE, claim.type, limit)
+        if decision.allowed:
+            return False
+        # Jitter spreads the deferred jobs so they don't all come back on the same tick.
+        delay = decision.retry_after * (1 + random.random())  # noqa: S311
+        if await jobs.defer_job(self.session_factory, claim, delay):
+            log.info("job_throttled", retry_in_seconds=round(delay, 3))
+        return True

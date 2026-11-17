@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from redis.exceptions import RedisError
-from sqlalchemy import func, insert, select, tuple_, update
+from sqlalchemy import delete, func, insert, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from workflow_engine.core.idempotency import IdempotencyConflictError, IdempotencyRequest
@@ -39,6 +39,14 @@ class JobSpec:
 
 
 @dataclass(frozen=True)
+class Enqueue:
+    """A job that became `queued` in a committed transaction and now needs an XADD."""
+
+    job_id: uuid.UUID
+    priority: Priority
+
+
+@dataclass(frozen=True)
 class SubmitResult:
     job: Job
     created: bool
@@ -53,6 +61,7 @@ class Claim:
     type: str
     payload: dict[str, Any]
     worker_id: str
+    priority: Priority = Priority.NORMAL
 
 
 class _ReplayError(Exception):
@@ -233,7 +242,7 @@ async def list_jobs(
 
 
 async def claim_job(
-    session_factory: SessionFactory, job_id: uuid.UUID, worker_id: str, lease_seconds: int
+    session_factory: SessionFactory, job_id: uuid.UUID, worker_id: str, lease_seconds: float
 ) -> Claim | None:
     """CAS claim: only a `queued` job can be claimed. None means stale/duplicate message."""
     async with session_factory() as session, session.begin():
@@ -248,13 +257,20 @@ async def claim_job(
                     lease_expires_at=func.now() + timedelta(seconds=lease_seconds),
                     attempts=Job.attempts + 1,
                 )
-                .returning(Job.lease_token, Job.attempts, Job.max_attempts, Job.type, Job.payload)
+                .returning(
+                    Job.lease_token,
+                    Job.attempts,
+                    Job.max_attempts,
+                    Job.type,
+                    Job.payload,
+                    Job.priority,
+                )
                 .execution_options(synchronize_session=False)
             )
         ).one_or_none()
         if row is None:
             return None
-        lease_token, attempt, max_attempts, job_type, payload = row
+        lease_token, attempt, max_attempts, job_type, payload, priority = row
         await session.execute(
             insert(JobAttempt).values(
                 job_id=job_id,
@@ -264,7 +280,7 @@ async def claim_job(
                 status=AttemptStatus.RUNNING,
             )
         )
-    return Claim(job_id, lease_token, attempt, max_attempts, job_type, payload, worker_id)
+    return Claim(job_id, lease_token, attempt, max_attempts, job_type, payload, worker_id, priority)
 
 
 def _fenced(claim: Claim) -> Any:
@@ -313,32 +329,404 @@ async def complete_job(session_factory: SessionFactory, claim: Claim, result: An
     return True
 
 
-async def fail_job(
-    session_factory: SessionFactory, claim: Claim, error: str, *, reason: str = "failed"
-) -> bool:
-    """Record a failed attempt. Single attempt for now: the job goes straight to `dead`.
+_RELEASE_LEASE: dict[str, Any] = {"lease_owner": None, "lease_expires_at": None}
 
-    Returns False if this worker was fenced out.
+
+async def fail_job(
+    session_factory: SessionFactory,
+    claim: Claim,
+    error: str,
+    *,
+    retry_delay: float,
+    retryable: bool = True,
+) -> JobStatus | None:
+    """Record a failed attempt: retry later (`pending`) or dead-letter once attempts run out.
+
+    Returns the new status, or None if this worker was fenced out.
     """
     error = error[:MAX_ERROR_CHARS]
+    retry = retryable and claim.attempt < claim.max_attempts
+    values: dict[str, Any] = {"last_error": error, **_RELEASE_LEASE}
+    if retry:
+        values |= {
+            "status": JobStatus.PENDING,
+            "run_at": func.now() + timedelta(seconds=retry_delay),
+        }
+    else:
+        values |= {"status": JobStatus.DEAD, "finished_at": func.now()}
     async with session_factory() as session, session.begin():
         updated = await session.execute(
             update(Job)
             .where(_fenced(claim))
-            .values(
-                status=JobStatus.DEAD,
-                last_error=error,
-                finished_at=func.now(),
-                lease_owner=None,
-                lease_expires_at=None,
+            .values(**values)
+            .returning(Job.id)
+            .execution_options(synchronize_session=False)
+        )
+        if updated.one_or_none() is None:
+            return None
+        await _finish_attempt(session, claim, AttemptStatus.FAILED, error)
+        if not retry:
+            reason = "failed" if retryable else "non_retryable"
+            await session.execute(
+                insert(DeadLetter).values(job_id=claim.job_id, reason=reason, last_error=error)
             )
+    return JobStatus.PENDING if retry else JobStatus.DEAD
+
+
+@dataclass(frozen=True)
+class LeaseState:
+    cancel_requested: bool
+
+
+async def heartbeat(
+    session_factory: SessionFactory, claim: Claim, lease_seconds: float
+) -> LeaseState | None:
+    """Extend the lease while the fencing token still matches. None means the lease is lost."""
+    async with session_factory() as session, session.begin():
+        row = (
+            await session.execute(
+                update(Job)
+                .where(_fenced(claim))
+                .values(lease_expires_at=func.now() + timedelta(seconds=lease_seconds))
+                .returning(Job.cancel_requested)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+    return None if row is None else LeaseState(cancel_requested=bool(row[0]))
+
+
+async def _fenced_transition(
+    session_factory: SessionFactory,
+    claim: Claim,
+    values: dict[str, Any],
+    attempt_status: AttemptStatus | None,
+    attempt_error: str | None = None,
+) -> bool:
+    """Fenced update of the job plus its attempt row. `attempt_status=None` deletes the row."""
+    async with session_factory() as session, session.begin():
+        updated = await session.execute(
+            update(Job)
+            .where(_fenced(claim))
+            .values(**values, **_RELEASE_LEASE)
             .returning(Job.id)
             .execution_options(synchronize_session=False)
         )
         if updated.one_or_none() is None:
             return False
-        await _finish_attempt(session, claim, AttemptStatus.FAILED, error)
-        await session.execute(
-            insert(DeadLetter).values(job_id=claim.job_id, reason=reason, last_error=error)
-        )
+        if attempt_status is None:
+            await session.execute(
+                delete(JobAttempt).where(
+                    JobAttempt.job_id == claim.job_id,
+                    JobAttempt.lease_token == claim.lease_token,
+                )
+            )
+        else:
+            await _finish_attempt(session, claim, attempt_status, attempt_error)
     return True
+
+
+async def cancel_running_job(session_factory: SessionFactory, claim: Claim) -> bool:
+    """The heartbeat saw `cancel_requested` and the handler was stopped: record `cancelled`."""
+    return await _fenced_transition(
+        session_factory,
+        claim,
+        {"status": JobStatus.CANCELLED, "finished_at": func.now()},
+        AttemptStatus.CANCELLED,
+        "cancelled",
+    )
+
+
+async def release_job(session_factory: SessionFactory, claim: Claim) -> bool:
+    """Shutdown grace ran out: hand the job back (`queued`). The attempt isn't counted."""
+    return await _fenced_transition(
+        session_factory,
+        claim,
+        {"status": JobStatus.QUEUED, "attempts": Job.attempts - 1, "run_at": func.now()},
+        AttemptStatus.RELEASED,
+        "released on worker shutdown",
+    )
+
+
+async def defer_job(session_factory: SessionFactory, claim: Claim, delay: float) -> bool:
+    """Execution throttle hit: put the job back in `pending` without counting an attempt.
+
+    The handler never started, so the attempt row is removed instead of being marked.
+    """
+    return await _fenced_transition(
+        session_factory,
+        claim,
+        {
+            "status": JobStatus.PENDING,
+            "attempts": Job.attempts - 1,
+            "run_at": func.now() + timedelta(seconds=delay),
+        },
+        None,
+    )
+
+
+# --------------------------------------------------------------------------- cancellation
+
+
+class JobNotFoundError(LookupError):
+    pass
+
+
+class InvalidTransitionError(Exception):
+    def __init__(self, status: JobStatus) -> None:
+        super().__init__(f"job is {status.value}")
+        self.status = status
+
+
+async def cancel_job(session_factory: SessionFactory, job_id: uuid.UUID) -> Job:
+    """Pending/queued jobs become `cancelled` now; running jobs get `cancel_requested`.
+
+    Raises JobNotFoundError, or InvalidTransitionError for a terminal job.
+    """
+    async with session_factory() as session, session.begin():
+        job = await session.get(Job, job_id, with_for_update=True)
+        if job is None:
+            raise JobNotFoundError(job_id)
+        if job.status in (JobStatus.PENDING, JobStatus.QUEUED):
+            # A stream entry for a queued job may remain; the CAS claim drops it.
+            job.status = JobStatus.CANCELLED
+            job.finished_at = datetime.now(UTC)
+        elif job.status == JobStatus.RUNNING:
+            job.cancel_requested = True
+        else:
+            raise InvalidTransitionError(job.status)
+        await session.flush()
+        await session.refresh(job)
+        return job
+
+
+# --------------------------------------------------------------------------- dead letters
+
+
+async def list_dead_letters(
+    session_factory: SessionFactory,
+    *,
+    include_requeued: bool = False,
+    limit: int = 50,
+    cursor: int | None = None,
+) -> tuple[list[tuple[DeadLetter, str]], int | None]:
+    """Newest first, keyset-paginated on id. Each row comes with its job's type."""
+    stmt = (
+        select(DeadLetter, Job.type)
+        .join(Job, Job.id == DeadLetter.job_id)
+        .order_by(DeadLetter.id.desc())
+        .limit(limit + 1)
+    )
+    if not include_requeued:
+        stmt = stmt.where(DeadLetter.requeued_at.is_(None))
+    if cursor is not None:
+        stmt = stmt.where(DeadLetter.id < cursor)
+    async with session_factory() as session:
+        rows = [(letter, job_type) for letter, job_type in (await session.execute(stmt)).all()]
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        next_cursor = rows[-1][0].id
+    return rows, next_cursor
+
+
+async def requeue_dead_letter(session_factory: SessionFactory, dead_letter_id: int) -> Job:
+    """Reset attempts, stamp `requeued_at`, and move the job back to `queued`.
+
+    The caller XADDs after commit. Raises JobNotFoundError or InvalidTransitionError.
+    """
+    async with session_factory() as session, session.begin():
+        letter = await session.get(DeadLetter, dead_letter_id, with_for_update=True)
+        if letter is None:
+            raise JobNotFoundError(dead_letter_id)
+        job = await session.get(Job, letter.job_id, with_for_update=True)
+        assert job is not None  # FK with ON DELETE CASCADE
+        if letter.requeued_at is not None or job.status != JobStatus.DEAD:
+            raise InvalidTransitionError(job.status)
+        letter.requeued_at = datetime.now(UTC)
+        job.status = JobStatus.QUEUED
+        job.attempts = 0
+        job.run_at = datetime.now(UTC)
+        job.finished_at = None
+        job.result = None
+        job.cancel_requested = False
+        await session.flush()
+        await session.refresh(job)
+        return job
+
+
+# --------------------------------------------------------------------------- maintenance
+
+
+async def promote_due(session_factory: SessionFactory, batch_size: int) -> list[Enqueue]:
+    """Scheduler: due `pending` jobs become `queued`, oldest `run_at` first."""
+    due = (
+        select(Job.id)
+        .where(Job.status == JobStatus.PENDING, Job.run_at <= func.now())
+        .order_by(Job.run_at)
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+        .scalar_subquery()
+    )
+    async with session_factory() as session, session.begin():
+        rows = (
+            await session.execute(
+                update(Job)
+                .where(Job.id.in_(due), Job.status == JobStatus.PENDING)
+                .values(status=JobStatus.QUEUED)
+                .returning(Job.id, Job.priority)
+                .execution_options(synchronize_session=False)
+            )
+        ).all()
+    return [Enqueue(job_id, priority) for job_id, priority in rows]
+
+
+@dataclass(frozen=True)
+class Reaped:
+    job_id: uuid.UUID
+    priority: Priority
+    status: JobStatus
+
+
+LEASE_EXPIRED = "lease_expired"
+
+
+async def reap_expired_leases(session_factory: SessionFactory, batch_size: int) -> list[Reaped]:
+    """Reaper: `running` jobs whose lease expired go back to `queued`, or `dead` when out of
+    attempts, or `cancelled` if a cancel was requested. The expired attempt counts as failed.
+
+    The status change fences out the old owner: its writes all require `status='running'`
+    plus its own lease_token, and the next claim bumps the token.
+    """
+    async with session_factory() as session, session.begin():
+        expired = (
+            await session.execute(
+                select(
+                    Job.id,
+                    Job.priority,
+                    Job.lease_token,
+                    Job.attempts,
+                    Job.max_attempts,
+                    Job.cancel_requested,
+                )
+                .where(Job.status == JobStatus.RUNNING, Job.lease_expires_at < func.now())
+                .order_by(Job.lease_expires_at)
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        reaped: list[Reaped] = []
+        for job_id, priority, token, attempts, max_attempts, cancel_requested in expired:
+            values: dict[str, Any] = {"last_error": LEASE_EXPIRED, **_RELEASE_LEASE}
+            if cancel_requested:
+                status = JobStatus.CANCELLED
+                values["finished_at"] = func.now()
+            elif attempts >= max_attempts:
+                status = JobStatus.DEAD
+                values["finished_at"] = func.now()
+            else:
+                status = JobStatus.QUEUED
+                values["run_at"] = func.now()
+            await session.execute(
+                update(Job)
+                .where(Job.id == job_id)
+                .values(status=status, **values)
+                .execution_options(synchronize_session=False)
+            )
+            await session.execute(
+                update(JobAttempt)
+                .where(
+                    JobAttempt.job_id == job_id,
+                    JobAttempt.lease_token == token,
+                    JobAttempt.status == AttemptStatus.RUNNING,
+                )
+                .values(
+                    status=AttemptStatus.LEASE_EXPIRED,
+                    error=LEASE_EXPIRED,
+                    finished_at=func.now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if status == JobStatus.DEAD:
+                await session.execute(
+                    insert(DeadLetter).values(
+                        job_id=job_id, reason=LEASE_EXPIRED, last_error=LEASE_EXPIRED
+                    )
+                )
+            reaped.append(Reaped(job_id, priority, status))
+    return reaped
+
+
+async def touch_stale_queued(
+    session_factory: SessionFactory, stale_seconds: float, batch_size: int
+) -> list[Enqueue]:
+    """Sweeper: `queued` jobs untouched for `stale_seconds` may have lost their stream entry.
+
+    Bumping `updated_at` means each job is re-sent at most once per window, so a long but
+    healthy backlog isn't flooded with duplicate hints (which the CAS claim would drop anyway).
+    """
+    stale = (
+        select(Job.id)
+        .where(
+            Job.status == JobStatus.QUEUED,
+            Job.updated_at < func.now() - timedelta(seconds=stale_seconds),
+        )
+        .order_by(Job.updated_at)
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+        .scalar_subquery()
+    )
+    async with session_factory() as session, session.begin():
+        rows = (
+            await session.execute(
+                update(Job)
+                .where(Job.id.in_(stale), Job.status == JobStatus.QUEUED)
+                .values(updated_at=func.now())
+                .returning(Job.id, Job.priority)
+                .execution_options(synchronize_session=False)
+            )
+        ).all()
+    return [Enqueue(job_id, priority) for job_id, priority in rows]
+
+
+async def queued_among(session_factory: SessionFactory, job_ids: set[uuid.UUID]) -> list[Enqueue]:
+    """The subset of `job_ids` that is still `queued` (needs a fresh stream entry)."""
+    if not job_ids:
+        return []
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(Job.id, Job.priority).where(
+                    Job.id.in_(job_ids), Job.status == JobStatus.QUEUED
+                )
+            )
+        ).all()
+    return [Enqueue(job_id, priority) for job_id, priority in rows]
+
+
+async def delete_expired_idempotency_keys(session_factory: SessionFactory, batch_size: int) -> int:
+    doomed = (
+        select(IdempotencyKey.api_key_id, IdempotencyKey.key)
+        .where(IdempotencyKey.expires_at <= func.now())
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    async with session_factory() as session, session.begin():
+        result = await session.execute(
+            delete(IdempotencyKey)
+            .where(tuple_(IdempotencyKey.api_key_id, IdempotencyKey.key).in_(doomed))
+            .returning(IdempotencyKey.key)
+        )
+        return len(result.all())
+
+
+async def idempotency_key_exists(session_factory: SessionFactory, idem: IdempotencyRequest) -> bool:
+    """A live key means this request is a replay (exempt from the submission limit)."""
+    async with session_factory() as session:
+        found = await session.scalar(
+            select(IdempotencyKey.job_id).where(
+                IdempotencyKey.api_key_id == idem.api_key_id,
+                IdempotencyKey.key == idem.key,
+                IdempotencyKey.expires_at > func.now(),
+            )
+        )
+    return found is not None

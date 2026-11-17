@@ -9,10 +9,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from workflow_engine import __version__
-from workflow_engine.api.routes import health, jobs
+from workflow_engine.api.routes import dlq, health, jobs
 from workflow_engine.config import Settings, get_settings
 from workflow_engine.core.idempotency import IdempotencyConflictError
 from workflow_engine.db.session import create_engine, create_session_factory
+from workflow_engine.dispatch.rate_limit import TokenBucket
 from workflow_engine.dispatch.streams import StreamProducer, create_redis
 from workflow_engine.handlers.registry import HandlerRegistry, load_builtin_handlers
 from workflow_engine.logging import configure_logging
@@ -35,6 +36,7 @@ def create_app(
         app.state.producer = StreamProducer(
             redis, settings.redis_stream_prefix, settings.stream_maxlen
         )
+        app.state.limiter = TokenBucket(redis, settings.redis_stream_prefix)
         try:
             yield
         finally:
@@ -46,6 +48,7 @@ def create_app(
     app.state.registry = registry
     app.include_router(health.router)
     app.include_router(jobs.router)
+    app.include_router(dlq.router)
 
     @app.exception_handler(IdempotencyConflictError)
     async def _idempotency_conflict(

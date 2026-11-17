@@ -91,3 +91,18 @@ class JobDetail(JobOut):
 class JobList(BaseModel):
     items: list[JobOut]
     next_cursor: str | None
+
+
+class DeadLetterOut(BaseModel):
+    id: int
+    job_id: uuid.UUID
+    job_type: str
+    reason: str
+    last_error: str | None
+    dead_at: datetime
+    requeued_at: datetime | None
+
+
+class DeadLetterList(BaseModel):
+    items: list[DeadLetterOut]
+    next_cursor: str | None

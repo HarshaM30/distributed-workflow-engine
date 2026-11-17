@@ -69,3 +69,14 @@ def test_env_example_covers_every_setting() -> None:
     }
     missing = set(Settings.model_fields) - keys
     assert not missing, f"settings missing from .env.example: {sorted(missing)}"
+
+
+def test_heartbeat_must_be_shorter_than_lease() -> None:
+    with pytest.raises(ValueError, match="WORKER_HEARTBEAT_SECONDS"):
+        make(worker_heartbeat_seconds=30, worker_lease_seconds=30)
+    assert make(worker_heartbeat_seconds=0.2, worker_lease_seconds=1).worker_lease_seconds == 1
+
+
+def test_submit_rate_limit_bundles_rate_and_burst() -> None:
+    limit = make(submit_rate_limit_per_second=2.5, submit_rate_limit_burst=7).submit_rate_limit
+    assert (limit.rate, limit.burst) == (2.5, 7)

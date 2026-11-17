@@ -1,4 +1,9 @@
-"""SIGTERM/SIGINT handling: stop reading new messages and let in-flight jobs finish."""
+"""SIGTERM/SIGINT handling and the drain deadline.
+
+On a signal the worker stops reading new messages. In-flight jobs get
+`WORKER_SHUTDOWN_GRACE_SECONDS` to finish; after that their leases are released (back to
+`queued`) instead of being abandoned until the reaper notices.
+"""
 
 from __future__ import annotations
 
@@ -20,3 +25,9 @@ def install_signal_handlers(stop: asyncio.Event) -> None:
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_stop, sig)
+
+
+async def drain_deadline(stop: asyncio.Event, grace_seconds: float) -> None:
+    """Returns `grace_seconds` after `stop` is set (never, if it isn't)."""
+    await stop.wait()
+    await asyncio.sleep(grace_seconds)

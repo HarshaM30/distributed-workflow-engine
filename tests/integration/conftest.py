@@ -24,8 +24,10 @@ from sqlalchemy.engine import make_url
 from workflow_engine.api.app import create_app
 from workflow_engine.config import Settings
 from workflow_engine.db.session import create_engine, create_session_factory
-from workflow_engine.dispatch.streams import StreamConsumer, create_redis
+from workflow_engine.dispatch.rate_limit import TokenBucket
+from workflow_engine.dispatch.streams import StreamConsumer, StreamProducer, create_redis
 from workflow_engine.handlers.registry import HandlerRegistry, JobContext, load_builtin_handlers
+from workflow_engine.maintenance.main import Maintenance
 from workflow_engine.worker.runner import Worker
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +72,19 @@ def test_settings() -> Settings:
             "api_keys": [SecretStr(API_KEY_A), SecretStr(API_KEY_B)],
             "worker_block_ms": 100,
             "db_pool_size": 20,
+            # Fast timings so reliability tests finish in seconds.
+            "worker_heartbeat_seconds": 0.2,
+            "worker_lease_seconds": 30,
+            "scheduler_interval_seconds": 0.1,
+            "reaper_interval_seconds": 0.2,
+            "sweeper_interval_seconds": 0.3,
+            "sweeper_stale_seconds": 1,
+            "maintenance_leader_retry_seconds": 0.2,
+            "retry_base_delay_seconds": 0.3,
+            "retry_max_delay_seconds": 5,
+            "rate_limits": {},
+            "submit_rate_limit_per_second": 1000,
+            "submit_rate_limit_burst": 1000,
         }
     )
 
@@ -107,6 +122,7 @@ class CountPayload(BaseModel):
 
     seconds: float = 0
     fail: bool = False
+    fail_times: int = 0  # fail the first N executions of this job, then succeed
 
 
 @pytest.fixture
@@ -123,7 +139,7 @@ def registry(counter: ExecutionCounter) -> HandlerRegistry:
     async def count(payload: CountPayload, ctx: JobContext) -> dict[str, int]:
         counter.calls.append(ctx.job_id)
         await asyncio.sleep(payload.seconds)
-        if payload.fail:
+        if payload.fail or counter.calls.count(ctx.job_id) <= payload.fail_times:
             raise RuntimeError("asked to fail")
         return {"executions": len(counter.calls)}
 
@@ -144,13 +160,14 @@ async def make_worker(
     engines = []
     redises: list[Redis] = []
 
-    def factory(worker_id: str = "test-worker") -> Worker:
-        engine = create_engine(test_settings)
-        redis = create_redis(test_settings)
+    def factory(worker_id: str = "test-worker", settings: Settings | None = None) -> Worker:
+        settings = settings or test_settings
+        engine = create_engine(settings)
+        redis = create_redis(settings)
         engines.append(engine)
         redises.append(redis)
         return Worker(
-            settings=test_settings,
+            settings=settings,
             session_factory=create_session_factory(engine),
             consumer=StreamConsumer(
                 redis,
@@ -160,6 +177,8 @@ async def make_worker(
             ),
             registry=registry,
             worker_id=worker_id,
+            dispatcher=StreamProducer(redis, settings.redis_stream_prefix, settings.stream_maxlen),
+            limiter=TokenBucket(redis, settings.redis_stream_prefix),
         )
 
     yield factory
@@ -177,6 +196,66 @@ async def running_worker(make_worker: Callable[..., Worker]) -> AsyncIterator[Wo
     yield worker
     stop.set()
     await asyncio.wait_for(task, timeout=10)
+
+
+@pytest.fixture
+async def make_maintenance(test_settings: Settings) -> AsyncIterator[Callable[..., Maintenance]]:
+    engines = []
+    redises: list[Redis] = []
+
+    def factory(name: str = "maintenance", settings: Settings | None = None) -> Maintenance:
+        settings = settings or test_settings
+        engine = create_engine(settings)
+        redis = create_redis(settings)
+        engines.append(engine)
+        redises.append(redis)
+        return Maintenance(
+            settings=settings,
+            session_factory=create_session_factory(engine),
+            redis=redis,
+            dispatcher=StreamProducer(redis, settings.redis_stream_prefix, settings.stream_maxlen),
+            name=name,
+        )
+
+    yield factory
+    for redis in redises:
+        await redis.aclose()
+    for engine in engines:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def running_maintenance(
+    make_maintenance: Callable[..., Maintenance],
+) -> AsyncIterator[Maintenance]:
+    maintenance = make_maintenance()
+    stop = asyncio.Event()
+    task = asyncio.create_task(maintenance.run(stop))
+    yield maintenance
+    stop.set()
+    await asyncio.wait_for(task, timeout=10)
+
+
+async def run_in_background(
+    runner: Worker | Maintenance,
+) -> tuple[asyncio.Event, asyncio.Task[None]]:
+    stop = asyncio.Event()
+    return stop, asyncio.create_task(runner.run(stop))
+
+
+async def wait_until(
+    predicate: Callable[[], Any], within: float = 10, message: str = "condition"
+) -> None:
+    deadline = asyncio.get_running_loop().time() + within
+    while True:
+        result = predicate()
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result:
+            return
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"timed out waiting for {message}")
+        await asyncio.sleep(0.05)
 
 
 async def wait_for_status(
