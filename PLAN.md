@@ -29,16 +29,29 @@ These decisions shape every milestone, so they are settled here first.
 4. **Delayed jobs and retry backoff both use `run_at`.** Jobs with a future `run_at` stay in
    `pending` in Postgres. A scheduler loop moves due jobs to `queued` and XADDs them. Redis
    never holds timers.
-5. **Priorities map to separate streams.** Redis Streams have no priority ordering, so each
-   priority level (`high`, `normal`, `low`) gets its own stream, and workers poll them in
-   that order. The API takes a priority value and maps it to one of the three levels.
+5. **Three fixed priority levels, each with its own stream.** Redis Streams have no
+   priority ordering, so `high`, `normal`, and `low` each get a stream (`jobs:high`,
+   `jobs:normal`, `jobs:low`), and workers poll them in that order. The API accepts only
+   these three values.
 6. **Maintenance loops run in their own process.** The reaper, sweeper, and scheduler run in
    a `maintenance` process that holds a Postgres advisory lock (leader election). You can
    run several copies safely, and only one is active at a time.
-7. **Rate limiting happens at dispatch.** A token bucket per job type, implemented as an
-   atomic Redis Lua script, gates when a worker may *start* a job of that type. A worker
-   that finds the bucket empty puts the job back with a short delay. If Redis is down, the
-   limiter fails open and logs a warning. See question Q1.
+7. **Rate limiting happens at two layers, both using token buckets in an atomic Redis Lua
+   script.**
+   - *Execution throttle, per job type:* gates when a worker may *start* a job of that
+     type. A worker that finds the bucket empty puts the job back in `pending` with a short
+     `run_at` delay. Jobs are delayed, never rejected.
+   - *Submission limit, per client (API key):* `POST /jobs` returns **429** with a
+     `Retry-After` header when a client goes over its limit. Idempotent replays of a job
+     that already exists don't use up tokens.
+   - If Redis is down, both limiters fail open and log a warning. Postgres stays the
+     source of truth, so an outage in the limiter never loses jobs.
+8. **Delivery guarantee: at-least-once execution, with each job's result saved exactly
+   once.** A handler may run more than once (for example, after a worker crash), but fencing
+   tokens make sure only one attempt's result is ever committed. Handlers are written to be
+   idempotent. README, docs, and benchmarks all use this exact wording.
+9. **Benchmark unit: one worker is one process running one job at a time.** Scaling from 1
+   to 8 workers means 1 to 8 processes, which gives a clean comparison.
 
 ### Job state machine
 
@@ -92,7 +105,7 @@ distributed-workflow-engine/
 │   │   └── idempotency.py        # key lookup, request hashing, conflict detection
 │   ├── dispatch/
 │   │   ├── streams.py            # Redis Streams producer/consumer, consumer groups
-│   │   ├── rate_limit.py         # token bucket wrapper
+│   │   ├── rate_limit.py         # token buckets: per job type (execution) + per client (submission)
 │   │   └── lua/token_bucket.lua
 │   ├── handlers/
 │   │   ├── registry.py           # @handler decorator, per-type config (max_attempts, timeout)
@@ -104,7 +117,7 @@ distributed-workflow-engine/
 │   │   ├── app.py                # FastAPI factory, lifespan, middleware
 │   │   ├── auth.py               # X-API-Key dependency
 │   │   ├── schemas.py            # Pydantic request/response models
-│   │   └── routes/{jobs,dlq,health}.py
+│   │   └── routes/{jobs,dlq,embeddings,health}.py
 │   ├── worker/
 │   │   ├── main.py               # entrypoint: `python -m workflow_engine.worker`
 │   │   ├── runner.py             # read → claim → execute → finalize loop
@@ -129,7 +142,9 @@ distributed-workflow-engine/
 │   ├── architecture.md
 │   ├── delivery-guarantees.md
 │   └── demo.gif
-├── .github/workflows/ci.yml
+├── .github/workflows/
+│   ├── ci.yml                    # every push: lint, unit, integration
+│   └── chaos-bench.yml           # manual trigger only (workflow_dispatch)
 ├── Dockerfile                    # one multi-stage image; API / worker / maintenance chosen by command
 ├── docker-compose.yml
 ├── Makefile
@@ -162,8 +177,9 @@ distributed-workflow-engine/
       with details for each component.
 - [ ] `Makefile` targets: `install`, `up`, `down`, `migrate`, `api`, `worker`,
       `maintenance`, `lint`, `fmt`, `test-unit`, `test-integration`, `test-chaos`, `bench`.
-- [ ] GitHub Actions `ci.yml`: ruff check + format check, then unit tests, then integration
-      tests against Postgres (pgvector image) and Redis service containers. Cache uv.
+- [ ] GitHub Actions `ci.yml`, run on every push: ruff check + format check, then unit
+      tests, then integration tests against Postgres (pgvector image) and Redis service
+      containers. Cache uv. Chaos tests and benchmarks are left out (see Milestone 5).
 
 **Done when**
 - [ ] `make up && make migrate` on a clean checkout creates all tables.
@@ -232,7 +248,12 @@ distributed-workflow-engine/
       `cancelled` immediately. A `running` job gets `cancel_requested` set, the heartbeat
       sees it and cancels the handler task, and the final state is `cancelled`. Terminal
       jobs return 409.
-- [ ] Token-bucket rate limiter (Lua script, per job type, configured by `RATE_LIMITS`).
+- [ ] Token-bucket Lua script shared by both limiters.
+- [ ] Execution throttle per job type (configured by `RATE_LIMITS`). An empty bucket
+      delays the job and never rejects it.
+- [ ] Submission limit per client on `POST /jobs`, keyed by API key (configured by
+      `SUBMIT_RATE_LIMIT_PER_SECOND` / `SUBMIT_RATE_LIMIT_BURST`). Returns 429 with
+      `Retry-After`, and idempotent replays are exempt.
 
 **Done when**
 - [ ] A `flaky` job with p=1.0 and max_attempts=3 ends up `dead` with exactly 3 attempts.
@@ -248,7 +269,11 @@ distributed-workflow-engine/
 - [ ] A job with `run_at` 10s in the future doesn't start before then.
 - [ ] Cancel works in each state (pending, queued, running, terminal) and each case is
       tested.
-- [ ] A rate limit of 5/s on a type caps execution starts at roughly 5/s, within tolerance.
+- [ ] An execution limit of 5/s on a type caps execution starts at roughly 5/s, within
+      tolerance, and every throttled job still completes.
+- [ ] A client that goes over its submission limit gets 429 with a valid `Retry-After`.
+      Other API keys aren't affected, and replaying an existing Idempotency-Key still
+      returns 200.
 
 ### Milestone 4: Observability and the ML job
 
@@ -265,8 +290,10 @@ distributed-workflow-engine/
 - [ ] `embed_texts` handler: payload is a list of texts (with a cap), embedded in batches
       with fastembed `BAAI/bge-small-en-v1.5` (384 dimensions). Upserts on
       `(job_id, item_index)` so retries stay idempotent. Model is cached in a volume.
-- [ ] Optional nearest-neighbour endpoint `GET /embeddings/search?q=` to show the stored
-      vectors are usable (see Q5).
+- [ ] `GET /embeddings/search?q=&k=&job_id=`, which requires an API key. It embeds the
+      query with the same model and returns the top-k nearest stored texts by cosine
+      distance, using the HNSW index. `k` is validated and capped, and `job_id` optionally
+      limits the search to one job's texts. The model is loaded once per process, lazily.
 
 **Done when**
 - [ ] Every log line is valid JSON, and a single job's lines can be filtered by `job_id`.
@@ -274,6 +301,9 @@ distributed-workflow-engine/
 - [ ] `/metrics` scrapes cleanly and the counters move when jobs run.
 - [ ] An `embed_texts` job with 100 texts stores 100 vectors. Retrying it leaves the row
       count at 100.
+- [ ] `GET /embeddings/search` returns a semantically related text as the top hit for a
+      paraphrased query (integration test with a small fixed corpus). EXPLAIN shows the
+      HNSW index being used.
 - [ ] The worker image stays reasonably small with no PyTorch in the dependency tree
       (verified with `uv tree`).
 
@@ -282,7 +312,8 @@ distributed-workflow-engine/
 **Tasks**
 - [ ] Load generator: submits N `sleep(0)` or short `cpu` jobs and measures end-to-end
       latency (`finished_at - created_at`) from Postgres.
-- [ ] Throughput runs at 1, 2, 4, and 8 workers, with 3 runs each and the median reported.
+- [ ] Throughput runs at 1, 2, 4, and 8 workers, where each worker is one process running
+      one job at a time. 3 runs each, median reported.
 - [ ] Chaos harness: randomly `docker kill` workers during a run, restart Redis mid-run,
       then check the invariants: every job is terminal, none lost, and
       `succeeded + dead == submitted`.
@@ -293,7 +324,10 @@ distributed-workflow-engine/
 - [ ] `tests/chaos/` pytest suite, a smaller version of the harness, marked `chaos` and run
       via `make test-chaos`.
 - [ ] `benchmarks/results.md`: machine specs (chip, RAM, OS, Docker resource limits), the
-      method, tables, and a discussion of the results.
+      method (including the definition of a worker), tables, and a discussion of the results.
+- [ ] `.github/workflows/chaos-bench.yml`, triggered only by `workflow_dispatch`. It runs
+      the chaos suite and a reduced benchmark and uploads the results as an artifact. It
+      never runs on push.
 
 **Done when**
 - [ ] `make bench` reproduces the results tables in a single command.
@@ -301,6 +335,8 @@ distributed-workflow-engine/
 - [ ] Duplicate executions are reported honestly (expected to be above 0 under kills) and
       explained.
 - [ ] `results.md` is committed with specs, method, and numbers.
+- [ ] `chaos-bench.yml` succeeds when triggered by hand from the Actions tab, and `ci.yml`
+      still doesn't run chaos tests or benchmarks.
 
 ### Milestone 6: Kubernetes (kind)
 
@@ -329,7 +365,8 @@ distributed-workflow-engine/
       (`make up && make demo`), API examples, a link to the benchmark results, a delivery
       guarantees section, design trade-offs (including why not use Postgres
       `SKIP LOCKED` alone, and why Streams over lists), and a testing strategy section.
-- [ ] `docs/delivery-guarantees.md`: at-least-once execution, fencing tokens, idempotent
+- [ ] `docs/delivery-guarantees.md`: "at-least-once execution, with each job's result saved
+      exactly once", fencing tokens, idempotent
       handler patterns (upsert on natural keys, side-effect tables), and failure scenarios
       laid out step by step.
 - [ ] Demo GIF recorded with `vhs` (scripted terminal recording, so it can be reproduced).
@@ -337,47 +374,40 @@ distributed-workflow-engine/
       pgvector, managed Redis, container platform, secrets, scaling). It should not claim
       anything has been deployed.
 
+- [ ] Pre-release history check across every commit on every branch: no secrets or
+      credentials (scanned with `gitleaks`), no `.env` files, no locally excluded files, no
+      attribution trailers in commit messages, and author identity is consistent. Fix
+      anything found before the repo goes public.
+
 **Done when**
 - [ ] A fresh clone gets a working demo by following only the README.
 - [ ] The Mermaid diagram renders on GitHub.
 - [ ] Every number in the README matches `benchmarks/results.md`.
+- [ ] The history check passes with zero findings.
+- [ ] The repo owner switches the repo from private to public. This is a manual step, done
+      only after everything above is complete.
 
 ---
 
-## 4. Questions and suggested changes
+## 4. Decisions log
 
-**Q1. Where should rate limiting apply?** The plan throttles at *execution* (backpressure,
-with jobs delayed rather than rejected). The alternative is rejecting *submissions* with 429
-and `Retry-After`. Execution-side throttling fits a job queue better, for example protecting
-a downstream API, but I could do both. Which do you want?
+These questions came up during planning and are now settled.
 
-**Q2. Exactly-once from the client's view.** I'd describe this as "at-least-once execution,
-with exactly-once *result commitment* through fencing tokens and idempotent handlers". That's
-more accurate than saying "exactly once" alone, and it holds up better in interviews. OK?
+| # | Topic | Decision |
+|---|---|---|
+| 1 | Rate limiting | **Both.** Execution is throttled per job type (jobs are delayed, never rejected), and submissions over a per-client (API key) limit get **429** with `Retry-After`. |
+| 2 | Delivery guarantee wording | **"At-least-once execution, with each job's result saved exactly once."** Used everywhere the guarantee is described. |
+| 3 | Benchmark unit | **One worker = one process running one job at a time.** |
+| 4 | Priorities | **Three fixed levels** (`high`, `normal`, `low`), each with its own Redis stream. |
+| 5 | Embedding search | **Added:** `GET /embeddings/search` (Milestone 4). |
+| 6 | Repo visibility | **Private until Milestone 7 and the history check are complete.** The owner then makes it public by hand. |
+| 7 | CI scope | Every push runs **lint, unit, and integration** tests. Chaos tests and benchmarks run **locally or by manual `workflow_dispatch` only**. |
 
-**Q3. What counts as a "worker" in benchmarks?** I suggest 1 worker = 1 process with
-concurrency 1, so scaling from 1 to 8 is a clean comparison. I'd add one extra run with
-in-process concurrency for comparison.
-
-**Q4. Priority levels.** Three fixed levels (`high`, `normal`, `low`) instead of arbitrary
-integers, because Streams can't order by priority. OK?
-
-**Q5. Embedding search endpoint.** I suggest adding `GET /embeddings/search` (outside the
-spec) so the ML use case covers storage *and* retrieval. It's small and makes a better
-demo. Add it?
-
-**Q6. Repo visibility.** The repo is private for now. Recruiters can't see a private repo, so
-plan to make it public once it's polished, probably after Milestone 5 or 7.
-
-**Q7. CI minutes.** Private repos get a limited number of free Actions minutes each month.
-Per-push CI covers lint, unit, and integration tests. Chaos tests and benchmarks run only
-through `workflow_dispatch` and locally, because they're slow and noisy on shared runners.
-
-**Suggested additions**
+### Adopted additions
 - **Per-job timeout** (configured on the handler) so a hung handler can't hold a lease
   forever through heartbeats.
 - **A side-effect ledger for the chaos tests**, so duplicate executions are *measured*
   rather than assumed.
 - **Property-based tests** (Hypothesis) for the state machine and the backoff bounds.
-- **`mypy --strict`** on `src/` in CI. It's cheap and signals quality.
-- **Keep Jaeger behind a compose profile** so the default `make up` stays light on memory.
+- **`mypy --strict`** on `src/` in CI.
+- **Jaeger behind a compose profile** so the default `make up` stays light on memory.
