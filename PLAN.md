@@ -442,7 +442,7 @@ distributed-workflow-engine/
 - [x] Duplicate executions are reported honestly (expected to be above 0 under kills) and
       explained.
 - [x] `results.md` is committed with specs, method, and numbers.
-- [ ] `chaos-bench.yml` succeeds when triggered by hand from the Actions tab, and `ci.yml`
+- [x] `chaos-bench.yml` succeeds when triggered by hand from the Actions tab, and `ci.yml`
       still doesn't run chaos tests or benchmarks.
 
 **Implementation notes**
