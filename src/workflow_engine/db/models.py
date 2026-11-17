@@ -1,4 +1,4 @@
-"""ORM models for the five tables in PLAN.md §1."""
+"""ORM models for the tables in PLAN.md §1, plus the chaos-test execution ledger."""
 
 from __future__ import annotations
 
@@ -155,3 +155,21 @@ class Embedding(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
+
+
+class JobExecution(Base):
+    """Side-effect ledger written by the `ledger` handler: one row per execution.
+
+    The chaos harness counts duplicates as executions minus jobs.
+    """
+
+    __tablename__ = "job_executions"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer)
+    worker_id: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(_tz(), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(_tz())

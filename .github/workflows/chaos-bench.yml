@@ -1,0 +1,61 @@
+name: Chaos and benchmarks
+
+# Manual only (Actions tab -> "Run workflow"). Never runs on push: chaos tests and benchmarks
+# are slow and need Docker. Results are uploaded as an artifact; benchmarks/results.md in the
+# repo comes from a local `make bench`.
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: Worker counts for the reduced benchmark
+        default: "1 2 4"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-bench
+  cancel-in-progress: false
+
+jobs:
+  chaos-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+
+      - name: Chaos test suite
+        run: uv run pytest -m chaos
+
+      - name: Reduced throughput benchmark
+        env:
+          WORKERS: ${{ inputs.workers || '1 2 4' }}
+        run: >-
+          uv run python -m benchmarks.run_throughput --no-build
+          --workers $WORKERS --runs 1
+          --sleep-jobs 2000 --cpu-jobs 600 --latency-seconds 10
+
+      - name: Chaos run
+        run: >-
+          uv run python -m benchmarks.run_chaos --no-build
+          --workers 3 --jobs 300 --submit-seconds 25
+
+      - name: Render results
+        if: always()
+        run: |
+          if [ -f benchmarks/raw/throughput.json ]; then
+            uv run python -m benchmarks.report --results benchmarks/raw/results-ci.md
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-bench-results
+          path: benchmarks/raw/
+          if-no-files-found: warn

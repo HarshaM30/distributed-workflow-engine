@@ -417,33 +417,59 @@ distributed-workflow-engine/
 ### Milestone 5: Benchmarks and chaos testing
 
 **Tasks**
-- [ ] Load generator: submits N `sleep(0)` or short `cpu` jobs and measures end-to-end
+- [x] Load generator: submits N `sleep(0)` or short `cpu` jobs and measures end-to-end
       latency (`finished_at - created_at`) from Postgres.
-- [ ] Throughput runs at 1, 2, 4, and 8 workers, where each worker is one process running
+- [x] Throughput runs at 1, 2, 4, and 8 workers, where each worker is one process running
       one job at a time. 3 runs each, median reported.
-- [ ] Chaos harness: randomly `docker kill` workers during a run, restart Redis mid-run,
+- [x] Chaos harness: randomly `docker kill` workers during a run, restart Redis mid-run,
       then check the invariants: every job is terminal, none lost, and
       `succeeded + dead == submitted`.
-- [ ] Duplicate-execution counter: handlers record each execution in a side table, so
+- [x] Duplicate-execution counter: handlers record each execution in a side table, so
       duplicates = executions − jobs.
-- [ ] Recovery-time measurement: time from worker kill to the orphaned job being claimed
+- [x] Recovery-time measurement: time from worker kill to the orphaned job being claimed
       again.
-- [ ] `tests/chaos/` pytest suite, a smaller version of the harness, marked `chaos` and run
+- [x] `tests/chaos/` pytest suite, a smaller version of the harness, marked `chaos` and run
       via `make test-chaos`.
-- [ ] `benchmarks/results.md`: machine specs (chip, RAM, OS, Docker resource limits), the
+- [x] `benchmarks/results.md`: machine specs (chip, RAM, OS, Docker resource limits), the
       method (including the definition of a worker), tables, and a discussion of the results.
-- [ ] `.github/workflows/chaos-bench.yml`, triggered only by `workflow_dispatch`. It runs
+- [x] `.github/workflows/chaos-bench.yml`, triggered only by `workflow_dispatch`. It runs
       the chaos suite and a reduced benchmark and uploads the results as an artifact. It
       never runs on push.
 
 **Done when**
-- [ ] `make bench` reproduces the results tables in a single command.
-- [ ] Chaos runs report **0 lost jobs** and exactly one terminal state per job.
-- [ ] Duplicate executions are reported honestly (expected to be above 0 under kills) and
+- [x] `make bench` reproduces the results tables in a single command.
+- [x] Chaos runs report **0 lost jobs** and exactly one terminal state per job.
+- [x] Duplicate executions are reported honestly (expected to be above 0 under kills) and
       explained.
-- [ ] `results.md` is committed with specs, method, and numbers.
+- [x] `results.md` is committed with specs, method, and numbers.
 - [ ] `chaos-bench.yml` succeeds when triggered by hand from the Actions tab, and `ci.yml`
       still doesn't run chaos tests or benchmarks.
+
+**Implementation notes**
+- Benchmarks and chaos runs use their own compose project, `wfe-bench`
+  (`benchmarks/compose.bench.yml` layered on `docker-compose.yml`), with separate Postgres,
+  Redis, API, maintenance, and worker containers on ports 5434/6380/8001. Every setting that
+  affects results is pinned there. Restarting Redis mid-run therefore can't touch development
+  data, and the project is removed with its volumes at the end. `REDIS_PORT` is a new compose
+  variable so the two stacks don't collide.
+- The drain benchmark bulk-inserts the backlog (`COPY`) and pipelines one XADD per job, leaving
+  the same state `POST /jobs` would, so the submitter never limits throughput. The latency
+  benchmark goes through the real API at a fixed open-loop rate (200 jobs/s). Results also
+  cover `cpu` jobs of 60,000 SHA-256 rounds (about 10 ms).
+- The side-effect ledger is a `ledger` handler plus a `job_executions` table (migration 0002).
+  A row is written when the handler starts and stamped when it finishes, so cut-short
+  executions are counted too.
+- Recovery is reported two ways: kill to lease reaped, and kill to job claimed again. The
+  second includes any wait for a free worker. The first full chaos run offered more work than 4
+  workers could do, so its re-claims waited tens of seconds behind the backlog. The defaults
+  now keep the pool at about half load (400 jobs over 60 s, 0.1-0.5 s each).
+- Chaos submissions carry an `Idempotency-Key` so a retried POST can't create a second job,
+  which is what makes the "no phantom jobs" invariant checkable.
+- `results.md` tables are regenerated between `BEGIN`/`END` markers by `benchmarks/report.py`;
+  the method and discussion around them are hand-written. Raw JSON stays in the ignored
+  `benchmarks/raw/`.
+- `chaos-bench.yml` runs the chaos suite, a reduced benchmark (1/2/4 workers, one run each), and
+  a smaller chaos run, then uploads `benchmarks/raw/` (including a rendered `results-ci.md`).
 
 ### Milestone 6: Kubernetes (kind)
 

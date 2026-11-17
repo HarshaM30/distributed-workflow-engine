@@ -92,6 +92,6 @@ handler = default_registry.register
 
 def load_builtin_handlers() -> HandlerRegistry:
     """Import the built-in handler modules (registration happens on import)."""
-    from workflow_engine.handlers import cpu, embed_texts, flaky, sleep  # noqa: F401
+    from workflow_engine.handlers import cpu, embed_texts, flaky, ledger, sleep  # noqa: F401
 
     return default_registry

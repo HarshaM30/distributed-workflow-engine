@@ -33,7 +33,7 @@ from workflow_engine.worker.runner import Worker
 REPO_ROOT = Path(__file__).resolve().parents[2]
 API_KEY_A = "test-key-a"
 API_KEY_B = "test-key-b"
-TABLES = "jobs, job_attempts, dead_letters, idempotency_keys, embeddings"
+TABLES = "jobs, job_attempts, dead_letters, idempotency_keys, embeddings, job_executions"
 
 
 def alembic_config(url: str) -> Config:

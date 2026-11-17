@@ -1,0 +1,50 @@
+# Benchmark / chaos stack: layered over docker-compose.yml and run as its own compose project
+# (`-p wfe-bench`), so it gets separate Postgres/Redis containers and volumes and never touches
+# development data. benchmarks/harness.py drives it; `down -v` removes everything afterwards.
+#
+# Every setting that affects the results is pinned here (these override values from a local
+# .env), so runs are comparable across machines.
+x-bench-env: &bench-env
+  API_KEYS: ${BENCH_API_KEY:-bench-key}
+  APP_ENV: benchmark
+  LOG_LEVEL: ${BENCH_LOG_LEVEL:-WARNING}
+  LOG_JSON: "true"
+  POSTGRES_USER: workflow
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: workflow
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "5"
+  RATE_LIMITS: "{}"
+  SUBMIT_RATE_LIMIT_PER_SECOND: "100000"
+  SUBMIT_RATE_LIMIT_BURST: "100000"
+  OTEL_ENABLED: "false"
+  WORKER_CONCURRENCY: "1"
+  # Empty: each worker names itself <hostname>-<pid>, i.e. <container id>-1.
+  WORKER_ID: ""
+  REDIS_STREAM_PREFIX: jobs
+  REDIS_CONSUMER_GROUP: workers
+  WORKER_LEASE_SECONDS: ${BENCH_LEASE_SECONDS:-30}
+  WORKER_HEARTBEAT_SECONDS: ${BENCH_HEARTBEAT_SECONDS:-10}
+  WORKER_SHUTDOWN_GRACE_SECONDS: "10"
+  REAPER_INTERVAL_SECONDS: ${BENCH_REAPER_INTERVAL_SECONDS:-5}
+  SWEEPER_INTERVAL_SECONDS: ${BENCH_SWEEPER_INTERVAL_SECONDS:-15}
+  SWEEPER_STALE_SECONDS: ${BENCH_SWEEPER_STALE_SECONDS:-30}
+  SCHEDULER_INTERVAL_SECONDS: "0.5"
+  RETRY_BASE_DELAY_SECONDS: "0.5"
+  RETRY_MAX_DELAY_SECONDS: "5"
+
+services:
+  migrate:
+    environment: *bench-env
+  api:
+    environment:
+      <<: *bench-env
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+  worker:
+    environment: *bench-env
+    # A killed container is restarted by the harness, not by Docker, so kill timing is known.
+    restart: "no"
+    stop_grace_period: 15s
+  maintenance:
+    environment: *bench-env

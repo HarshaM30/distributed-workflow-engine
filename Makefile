@@ -50,10 +50,12 @@ test-unit: ## Unit tests (no services)
 test-integration: ## Integration tests (needs `make up`)
 	$(UV) run pytest -m integration
 
-test-chaos: ## Chaos tests (local only, slow)
+test-chaos: ## Chaos tests (Docker; local or manual CI only, slow)
 	$(UV) run pytest -m chaos
 
 test: test-unit test-integration ## Unit + integration
 
-bench: ## Benchmarks -> benchmarks/results.md (Milestone 5)
-	@echo "benchmarks are not implemented yet (Milestone 5)" >&2; exit 1
+bench: ## Throughput + chaos runs -> benchmarks/results.md (Docker; ~15 min, own throwaway stack)
+	$(UV) run python -m benchmarks.run_throughput
+	$(UV) run python -m benchmarks.run_chaos --no-build
+	$(UV) run python -m benchmarks.report

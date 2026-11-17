@@ -7,7 +7,14 @@ from sqlalchemy.engine import make_url
 from tests.integration.conftest import alembic_config
 from workflow_engine.config import Settings
 
-EXPECTED_TABLES = {"jobs", "job_attempts", "dead_letters", "idempotency_keys", "embeddings"}
+EXPECTED_TABLES = {
+    "jobs",
+    "job_attempts",
+    "dead_letters",
+    "idempotency_keys",
+    "embeddings",
+    "job_executions",
+}
 
 
 def _tables(url: str) -> set[str]:

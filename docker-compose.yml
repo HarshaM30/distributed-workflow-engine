@@ -51,7 +51,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--maxmemory", "96mb", "--save", "", "--appendonly", "no"]
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:
