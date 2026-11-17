@@ -1,0 +1,78 @@
+# Scheduler, reaper, and sweeper. Extra replicas are safe (they wait on the Postgres
+# advisory lock), but one is enough here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maintenance
+  labels:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: maintenance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workflow-engine
+      app.kubernetes.io/component: maintenance
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workflow-engine
+        app.kubernetes.io/component: maintenance
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # Holds the pod until the migrate Job has brought the schema to head.
+        - name: wait-for-migrations
+          image: workflow-engine
+          command:
+            - sh
+            - -c
+            - until alembic current 2>/dev/null | grep -q "(head)"; do sleep 2; done
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: maintenance
+          image: workflow-engine
+          command: ["python", "-m", "workflow_engine.maintenance"]
+          ports:
+            - name: metrics
+              containerPort: 9101
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 192Mi}
+          securityContext: *container-security
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

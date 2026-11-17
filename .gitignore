@@ -42,3 +42,6 @@ benchmarks/raw/
 .vscode/
 .idea/
 .DS_Store
+
+# Local kind secrets (copied from deploy/k8s/secrets.example.env)
+deploy/k8s/secrets.env

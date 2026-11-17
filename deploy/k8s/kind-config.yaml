@@ -1,0 +1,12 @@
+# Single-node kind cluster for the workflow engine (`make k8s-up`).
+# The API's NodePort (30800) is published on the host as 127.0.0.1:8800.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: workflow-engine
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30800
+        hostPort: 8800
+        listenAddress: 127.0.0.1
+        protocol: TCP

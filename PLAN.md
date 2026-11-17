@@ -474,22 +474,56 @@ distributed-workflow-engine/
 ### Milestone 6: Kubernetes (kind)
 
 **Tasks**
-- [ ] kind cluster config (single node, port mappings) and a local image loaded with
+- [x] kind cluster config (single node, port mappings) and a local image loaded with
       `kind load docker-image`.
-- [ ] Manifests via kustomize: Postgres StatefulSet + PVC, Redis Deployment, a migration
+- [x] Manifests via kustomize: Postgres StatefulSet + PVC, Redis Deployment, a migration
       Job, API Deployment + Service, worker Deployment, maintenance Deployment, ConfigMap,
       and a Secret built from a committed example.
-- [ ] Readiness and liveness probes (`/health` for the API, a heartbeat-file or metrics
+- [x] Readiness and liveness probes (`/health` for the API, a heartbeat-file or metrics
       probe for workers), `terminationGracePeriodSeconds` set above the drain timeout, and
       resource requests and limits.
-- [ ] `make k8s-up`, `k8s-scale N=4`, `k8s-chaos` (deletes a random worker pod during load),
+- [x] `make k8s-up`, `k8s-scale N=4`, `k8s-chaos` (deletes a random worker pod during load),
       and `k8s-down` (deletes the cluster).
 
 **Done when**
-- [ ] Jobs submitted through a port-forwarded API complete inside the cluster.
-- [ ] `kubectl scale deploy/worker --replicas=4` increases throughput.
-- [ ] Deleting a worker pod mid-job still leaves every job completed.
-- [ ] `make k8s-down` removes the cluster and `kind get clusters` is empty.
+- [x] Jobs submitted through a port-forwarded API complete inside the cluster.
+- [x] `kubectl scale deploy/worker --replicas=4` increases throughput.
+- [x] Deleting a worker pod mid-job still leaves every job completed.
+- [x] `make k8s-down` removes the cluster and `kind get clusters` is empty.
+
+**Implementation notes**
+- Tested with kind v0.33. The single node maps the API's NodePort 30800 to `127.0.0.1:8800`;
+  `make k8s-port-forward` (`kubectl port-forward svc/api 8000:8000`) works too, and the "done
+  when" submission was checked through it.
+- The ConfigMap is generated from `deploy/k8s/config.env` and the Secret from a git-ignored
+  `deploy/k8s/secrets.env`, which `make k8s-up` copies from the committed `secrets.example.env`
+  when it is missing. Both get hash suffixes, so a config change rolls the Deployments. A unit
+  test keeps `config.env` + `secrets.example.env` in step with `.env.example` (minus the
+  compose-only `REDIS_PORT`). The cluster uses a 15 s lease, 5 s heartbeat, and 2 s reaper, and
+  a raised submission limit so the load script is never throttled.
+- The migrate Job retries `alembic upgrade head` until Postgres accepts connections, so
+  everything is applied in one go; `make k8s-up` deletes the finished Job first because a Job's
+  pod template is immutable. API, worker, and maintenance pods hold in a `wait-for-migrations`
+  init container until `alembic current` reports head.
+- Probes: the API's readiness probe is `/health`, but its liveness probe is a TCP check, since a
+  Redis outage shouldn't restart every API pod. Workers and maintenance use the metrics probe
+  (`/metrics` on 9100/9101); that server runs on the process's own event loop, so an answer
+  means the loop, and with it heartbeats, is still turning. `terminationGracePeriodSeconds` is
+  45 for workers against a 30 s drain.
+- App pods run as the image's non-root user with a read-only root filesystem and all
+  capabilities dropped; `/tmp` and the model cache are per-pod `emptyDir`s (kind has no shared
+  RWX volume). The kind node used about 1.35 GiB with 4 workers.
+- The worker Deployment has no `replicas` field, so re-running `make k8s-up` keeps the count
+  set by `make k8s-scale`. Re-running it after a code change reloads the same `workflow-engine:k8s`
+  tag and restarts the app Deployments.
+- `benchmarks/run_k8s.py` drives the cluster through the API only (new targets `k8s-load` and
+  `k8s-port-forward`). `load`: 200 `sleep(0.2)` jobs went from 4.76 jobs/s with 1 worker to
+  19.00 jobs/s with 4 (one run each). `k8s-chaos` force-deletes random worker pods
+  (`--grace-period=0 --force`) while paced 2-5 s jobs run at about 60% load: in the recorded run
+  4 deletions interrupted 3 jobs, each was reaped about 16 s after the kill (15 s lease plus the
+  reaper pass) and claimed again right away, and all 40 jobs succeeded. A force-deleted pod
+  still gets SIGTERM and about 2 s before SIGKILL, which is why the jobs outlast that window.
+  A graceful run (120 jobs, 3 deletions) drained cleanly with no interrupted attempts.
 
 ### Milestone 7: Documentation and polish
 

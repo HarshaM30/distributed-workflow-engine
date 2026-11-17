@@ -1,0 +1,48 @@
+# Runs `alembic upgrade head` once per `make k8s-up` (the Makefile deletes the finished Job
+# first, since a Job's pod template can't be changed in place). It retries until Postgres
+# accepts connections, so it can be applied together with everything else.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workflow-engine
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: workflow-engine
+          command:
+            - sh
+            - -c
+            - until alembic upgrade head; do echo "waiting for postgres"; sleep 2; done
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

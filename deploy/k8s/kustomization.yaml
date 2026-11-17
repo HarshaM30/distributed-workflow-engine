@@ -1,0 +1,37 @@
+# Render with `kubectl kustomize deploy/k8s`; apply with `make k8s-up`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: workflow-engine
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: workflow-engine
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - redis.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - maintenance.yaml
+
+# Non-secret settings. The generated name carries a content hash, so editing config.env and
+# re-applying rolls every Deployment that uses it.
+configMapGenerator:
+  - name: workflow-config
+    envs:
+      - config.env
+
+# `make k8s-up` copies secrets.example.env to secrets.env (git-ignored) when it is missing.
+secretGenerator:
+  - name: workflow-secrets
+    envs:
+      - secrets.env
+
+images:
+  - name: workflow-engine
+    newName: workflow-engine
+    newTag: k8s

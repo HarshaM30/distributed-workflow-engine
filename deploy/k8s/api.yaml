@@ -1,0 +1,106 @@
+# HTTP API. Published on the host through the kind port mapping (NodePort 30800 ->
+# 127.0.0.1:8800); `kubectl port-forward svc/api 8000:8000` works too.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: api
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: 30800
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workflow-engine
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workflow-engine
+        app.kubernetes.io/component: api
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # Holds the pod until the migrate Job has brought the schema to head.
+        - name: wait-for-migrations
+          image: workflow-engine
+          command:
+            - sh
+            - -c
+            - until alembic current 2>/dev/null | grep -q "(head)"; do sleep 2; done
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: api
+          image: workflow-engine
+          command: ["python", "-m", "workflow_engine.api"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          # /health checks Postgres and Redis, so it gates traffic. Liveness is a plain TCP
+          # check: a Redis outage shouldn't restart every API pod.
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            # Room for the ONNX embedding model, loaded on the first /embeddings/search.
+            limits: {memory: 512Mi}
+          securityContext: *container-security
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: modelcache
+              mountPath: /app/.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Per-pod model cache (the ONNX model is downloaded on first use).
+        - name: modelcache
+          emptyDir:
+            sizeLimit: 512Mi

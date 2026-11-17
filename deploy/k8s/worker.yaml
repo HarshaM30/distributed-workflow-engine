@@ -1,0 +1,90 @@
+# Workers: one process per pod, one job at a time (the benchmark unit). Scale with
+# `make k8s-scale N=4`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: workflow-engine
+    app.kubernetes.io/component: worker
+spec:
+  # No `replicas`: it defaults to 1 on create, and re-running `make k8s-up` then keeps
+  # whatever `make k8s-scale` set instead of resetting it.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workflow-engine
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workflow-engine
+        app.kubernetes.io/component: worker
+    spec:
+      # Above WORKER_SHUTDOWN_GRACE_SECONDS (30): on SIGTERM in-flight jobs get the grace
+      # period, then leases still held are released, and only then does the kubelet SIGKILL.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # Holds the pod until the migrate Job has brought the schema to head.
+        - name: wait-for-migrations
+          image: workflow-engine
+          command:
+            - sh
+            - -c
+            - until alembic current 2>/dev/null | grep -q "(head)"; do sleep 2; done
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          securityContext: &container-security
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: worker
+          image: workflow-engine
+          command: ["python", "-m", "workflow_engine.worker"]
+          ports:
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef: {name: workflow-config}
+            - secretRef: {name: workflow-secrets}
+          # The metrics server runs on the worker's event loop, so a scrape that answers
+          # means the loop (and with it heartbeats) is still turning.
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            # Room for the ONNX embedding model, loaded on the first embed_texts job.
+            limits: {memory: 512Mi}
+          securityContext: *container-security
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: modelcache
+              mountPath: /app/.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Per-pod model cache (the ONNX model is downloaded on first use).
+        - name: modelcache
+          emptyDir:
+            sizeLimit: 512Mi
