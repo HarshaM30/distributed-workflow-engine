@@ -203,33 +203,46 @@ distributed-workflow-engine/
 ### Milestone 2: Submission API, dispatch, and a basic worker
 
 **Tasks**
-- [ ] `X-API-Key` dependency. Keys come from `API_KEYS` and are compared in constant time.
+- [x] `X-API-Key` dependency. Keys come from `API_KEYS` and are compared in constant time.
       Applies to every route except `/health` and `/metrics`.
-- [ ] Pydantic schemas: job type must be a registered handler, payload validated against
+- [x] Pydantic schemas: job type must be a registered handler, payload validated against
       that handler's own payload model, priority enum, optional `run_at`, size limits.
-- [ ] `POST /jobs` (returns 201 with the job, or 200 for an idempotent replay).
-- [ ] `GET /jobs/{id}` with attempt history.
-- [ ] `GET /jobs?status=&type=&limit=&cursor=` with keyset pagination.
-- [ ] Idempotency: `Idempotency-Key` header scoped per API key, with a SHA-256 hash of the
+- [x] `POST /jobs` (returns 201 with the job, or 200 for an idempotent replay).
+- [x] `GET /jobs/{id}` with attempt history.
+- [x] `GET /jobs?status=&type=&limit=&cursor=` with keyset pagination.
+- [x] Idempotency: `Idempotency-Key` header scoped per API key, with a SHA-256 hash of the
       canonical request body. Same key and same body returns the original job. Same key
       with a different body returns 409. Handles concurrent duplicates with
       `INSERT … ON CONFLICT`. Expired keys are cleaned up by maintenance.
-- [ ] Streams producer: XADD to `jobs:{priority}` after commit. Consumer group created at
+- [x] Streams producer: XADD to `jobs:{priority}` after commit. Consumer group created at
       startup with `MKSTREAM`.
-- [ ] Handler registry plus the `sleep`, `cpu`, and `flaky` handlers. `cpu` runs in a
+- [x] Handler registry plus the `sleep`, `cpu`, and `flaky` handlers. `cpu` runs in a
       process or thread executor so it doesn't block the event loop.
-- [ ] Worker loop: XREADGROUP, then CAS claim in Postgres, then execute, then write the
+- [x] Worker loop: XREADGROUP, then CAS claim in Postgres, then execute, then write the
       result and an attempt row, then XACK. Single attempt only in this milestone.
 
 **Done when**
-- [ ] Requests without a key or with a wrong key get 401. `/health` stays open.
-- [ ] Invalid input (unknown type, bad payload, oversized body) gets 422 with a clear error.
-- [ ] Submitting a `sleep` job leads to `succeeded` in `GET /jobs/{id}` with one attempt.
-- [ ] An integration test fires 20 concurrent POSTs with the same Idempotency-Key and gets
+- [x] Requests without a key or with a wrong key get 401. `/health` stays open.
+- [x] Invalid input (unknown type, bad payload, oversized body) gets 422 with a clear error.
+- [x] Submitting a `sleep` job leads to `succeeded` in `GET /jobs/{id}` with one attempt.
+- [x] An integration test fires 20 concurrent POSTs with the same Idempotency-Key and gets
       exactly one job row.
-- [ ] Reusing a key with a different body returns 409.
-- [ ] Delivering the same stream message twice runs the handler only once, because the
+- [x] Reusing a key with a different body returns 409.
+- [x] Delivering the same stream message twice runs the handler only once, because the
       CAS claim rejects the second delivery (integration test).
+
+**Implementation notes**
+- Single attempt only: a handler error, timeout, or unknown type sends the job straight to
+  `dead` with a `dead_letters` row (reason `failed`). Milestone 3 replaces this with retries.
+- The per-handler timeout (an adopted addition) is already enforced with `asyncio.wait_for`.
+- Oversized payloads (`MAX_PAYLOAD_BYTES`, serialized JSON) get 422, as the checklist says.
+- If the XADD fails after commit, the API logs a warning and still returns 201. The job stays
+  `queued` until the Milestone 3 sweeper re-adds it.
+- An expired idempotency key is taken over in place by the `INSERT … ON CONFLICT DO UPDATE …
+  WHERE expires_at <= now()`. Deleting expired keys in bulk is still a maintenance task.
+- `GET /jobs/{id}` returns the attempts as `attempt_history`. Reads aren't scoped per API key.
+- Workers already read `high`, then `normal`, then `low`. The Milestone 3 priority task still
+  needs its mixed-backlog check.
 
 ### Milestone 3: Reliability
 

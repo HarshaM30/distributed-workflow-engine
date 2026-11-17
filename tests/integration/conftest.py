@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+import uuid
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -13,14 +16,17 @@ from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
 from psycopg import sql
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from workflow_engine.api.app import create_app
 from workflow_engine.config import Settings
-from workflow_engine.db.session import create_engine
+from workflow_engine.db.session import create_engine, create_session_factory
+from workflow_engine.dispatch.streams import StreamConsumer, create_redis
+from workflow_engine.handlers.registry import HandlerRegistry, JobContext, load_builtin_handlers
+from workflow_engine.worker.runner import Worker
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 API_KEY_A = "test-key-a"
@@ -80,16 +86,107 @@ async def clean_state(test_settings: Settings) -> None:
 
 
 @pytest.fixture
-async def app(test_settings: Settings) -> AsyncIterator[FastAPI]:
-    application = create_app(test_settings)
-    async with application.router.lifespan_context(application):
-        yield application
-
-
-@pytest.fixture
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test", headers={"X-API-Key": API_KEY_A}
     ) as c:
         yield c
+
+
+# --------------------------------------------------------------------------- worker helpers
+
+
+class ExecutionCounter:
+    def __init__(self) -> None:
+        self.calls: list[uuid.UUID] = []
+
+
+class CountPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: float = 0
+    fail: bool = False
+
+
+@pytest.fixture
+def counter() -> ExecutionCounter:
+    return ExecutionCounter()
+
+
+@pytest.fixture
+def registry(counter: ExecutionCounter) -> HandlerRegistry:
+    """Built-in handlers plus `count`, which records each execution."""
+    reg = load_builtin_handlers().copy()
+
+    @reg.register("count", payload_model=CountPayload, timeout_seconds=2)
+    async def count(payload: CountPayload, ctx: JobContext) -> dict[str, int]:
+        counter.calls.append(ctx.job_id)
+        await asyncio.sleep(payload.seconds)
+        if payload.fail:
+            raise RuntimeError("asked to fail")
+        return {"executions": len(counter.calls)}
+
+    return reg
+
+
+@pytest.fixture
+async def app(test_settings: Settings, registry: HandlerRegistry) -> AsyncIterator[FastAPI]:
+    application = create_app(test_settings, registry)
+    async with application.router.lifespan_context(application):
+        yield application
+
+
+@pytest.fixture
+async def make_worker(
+    test_settings: Settings, registry: HandlerRegistry
+) -> AsyncIterator[Callable[..., Worker]]:
+    engines = []
+    redises: list[Redis] = []
+
+    def factory(worker_id: str = "test-worker") -> Worker:
+        engine = create_engine(test_settings)
+        redis = create_redis(test_settings)
+        engines.append(engine)
+        redises.append(redis)
+        return Worker(
+            settings=test_settings,
+            session_factory=create_session_factory(engine),
+            consumer=StreamConsumer(
+                redis,
+                test_settings.redis_stream_prefix,
+                test_settings.redis_consumer_group,
+                worker_id,
+            ),
+            registry=registry,
+            worker_id=worker_id,
+        )
+
+    yield factory
+    for redis in redises:
+        await redis.aclose()
+    for engine in engines:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def running_worker(make_worker: Callable[..., Worker]) -> AsyncIterator[Worker]:
+    worker = make_worker()
+    stop = asyncio.Event()
+    task = asyncio.create_task(worker.run(stop))
+    yield worker
+    stop.set()
+    await asyncio.wait_for(task, timeout=10)
+
+
+async def wait_for_status(
+    client: httpx.AsyncClient, job_id: str, statuses: set[str], within: float = 10
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + within
+    while True:
+        body: dict[str, Any] = (await client.get(f"/jobs/{job_id}")).json()
+        if body["status"] in statuses:
+            return body
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"job {job_id} stuck in {body['status']}")
+        await asyncio.sleep(0.05)
