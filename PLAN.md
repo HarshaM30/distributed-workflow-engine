@@ -137,10 +137,13 @@ distributed-workflow-engine/
 │   ├── run_throughput.py         # 1/2/4/8 workers, jobs/s, p50/p95
 │   ├── run_chaos.py              # injected failures, lost/duplicate counts, recovery time
 │   └── results.md
+├── demo/                         # `make demo`: scripted kill-and-recover run + compose override
 ├── deploy/k8s/                   # kind config + kustomize manifests
 ├── docs/
 │   ├── architecture.md
 │   ├── delivery-guarantees.md
+│   ├── deploying-to-the-cloud.md
+│   ├── demo.tape                 # vhs script that records demo.gif
 │   └── demo.gif
 ├── .github/workflows/
 │   ├── ci.yml                    # every push: lint, unit, integration
@@ -528,31 +531,55 @@ distributed-workflow-engine/
 ### Milestone 7: Documentation and polish
 
 **Tasks**
-- [ ] README: pitch, Mermaid architecture diagram, one-command quickstart
+- [x] README: pitch, Mermaid architecture diagram, one-command quickstart
       (`make up && make demo`), API examples, a link to the benchmark results, a delivery
       guarantees section, design trade-offs (including why not use Postgres
       `SKIP LOCKED` alone, and why Streams over lists), and a testing strategy section.
-- [ ] `docs/delivery-guarantees.md`: "at-least-once execution, with each job's result saved
+- [x] `docs/delivery-guarantees.md`: "at-least-once execution, with each job's result saved
       exactly once", fencing tokens, idempotent
       handler patterns (upsert on natural keys, side-effect tables), and failure scenarios
       laid out step by step.
-- [ ] Demo GIF recorded with `vhs` (scripted terminal recording, so it can be reproduced).
-- [ ] A "Deploying to the cloud" guide, clearly worded as a guide (managed Postgres with
+- [x] Demo GIF recorded with `vhs` (scripted terminal recording, so it can be reproduced).
+- [x] A "Deploying to the cloud" guide, clearly worded as a guide (managed Postgres with
       pgvector, managed Redis, container platform, secrets, scaling). It should not claim
       anything has been deployed.
 
-- [ ] Pre-release history check across every commit on every branch: no secrets or
+- [x] Pre-release history check across every commit on every branch: no secrets or
       credentials (scanned with `gitleaks`), no `.env` files, no locally excluded files, no
       attribution trailers in commit messages, and author identity is consistent. Fix
       anything found before the repo goes public.
 
 **Done when**
-- [ ] A fresh clone gets a working demo by following only the README.
-- [ ] The Mermaid diagram renders on GitHub.
-- [ ] Every number in the README matches `benchmarks/results.md`.
-- [ ] The history check passes with zero findings.
+- [x] A fresh clone gets a working demo by following only the README.
+- [x] The Mermaid diagram renders on GitHub.
+- [x] Every number in the README matches `benchmarks/results.md`.
+- [x] The history check passes with zero findings.
 - [ ] The repo owner switches the repo from private to public. This is a manual step, done
       only after everything above is complete.
+
+**Implementation notes**
+- `make demo` (new targets `demo` and `demo-stack`) starts the API, maintenance, and 3 workers in
+  the normal compose project, with `demo/compose.demo.yml` shortening the lease to 5 s (heartbeat
+  1 s, reaper 1 s). `demo/run.py` submits 4 `sleep(3)` jobs with Idempotency-Keys, replays one key,
+  SIGKILLs the worker running a job, redraws a job board until the reaper hands that job to
+  another worker, prints its attempt history (`lease_expired` under token 1, `succeeded` under
+  token 2), and starts the killed container again. It talks to the API only, except for the
+  `docker kill`. `demo-stack` writes compose output to a temp log and prints it only on failure.
+- `make up` now creates `.env` from `.env.example` when it is missing (the same pattern `k8s-up`
+  uses for `secrets.env`), so the README quickstart on a fresh clone is `make up && make demo`.
+- The GIF is recorded with vhs from `docs/demo.tape`; the stack is started off camera so the
+  recording skips the image build. `make demo-stack && vhs docs/demo.tape` re-records it.
+- Docs: `docs/architecture.md` (processes, state machine, data model, Redis layout, the path of a
+  job), `docs/delivery-guarantees.md`, and `docs/deploying-to-the-cloud.md`, which opens by saying
+  that nothing has been deployed and that the provider names are untested examples.
+- The README's Mermaid diagram was checked by rendering it with Mermaid 11.4.1 in headless
+  Chrome (no parse errors); labels use only `<br/>`, which GitHub's sanitizer keeps. Every README
+  number is taken from `benchmarks/results.md`; the kind throughput numbers stay in this file only.
+- mypy now also checks `demo/`, and `tests/unit/test_demo.py` covers the demo's helpers.
+- History check: `gitleaks git --log-opts=--all` found nothing in any commit; no `.env`,
+  `secrets.env`, `.cache/`, or locally excluded file was ever committed; no commit message has an
+  attribution trailer; every commit has the same author and committer identity. (`gitleaks dir`
+  on the working tree flags only the git-ignored local `.env`.)
 
 ---
 

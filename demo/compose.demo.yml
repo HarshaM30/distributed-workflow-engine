@@ -1,0 +1,21 @@
+# Demo overrides, layered on docker-compose.yml by `make demo` (same `workflow-engine` project,
+# so `make down` stops it). Short leases make a killed worker's job come back within seconds
+# instead of the default 30 s; everything else comes from .env as usual.
+x-demo-env: &demo-env
+  WORKER_ID: ""  # each container names itself <container id>-<pid>
+  WORKER_CONCURRENCY: "1"
+  WORKER_LEASE_SECONDS: "5"
+  WORKER_HEARTBEAT_SECONDS: "1"
+  REAPER_INTERVAL_SECONDS: "1"
+  SCHEDULER_INTERVAL_SECONDS: "0.5"
+  LOG_LEVEL: WARNING
+
+services:
+  api:
+    environment: *demo-env
+  maintenance:
+    environment: *demo-env
+  worker:
+    environment: *demo-env
+    # The demo restarts the worker it kills itself, so the timing on screen is its own.
+    restart: "no"

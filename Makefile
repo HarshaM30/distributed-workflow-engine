@@ -10,7 +10,7 @@ N ?= 4
 
 .DEFAULT_GOAL := help
 .PHONY: help install up down tracing-up migrate api worker maintenance lint fmt typecheck \
-        test-unit test-integration test-chaos test bench \
+        test-unit test-integration test-chaos test bench demo demo-stack \
         k8s-up k8s-scale k8s-load k8s-chaos k8s-port-forward k8s-down
 
 help: ## List targets
@@ -19,7 +19,8 @@ help: ## List targets
 install: ## Install runtime + dev dependencies
 	$(UV) sync
 
-up: ## Start Postgres + Redis and wait until healthy
+up: ## Start Postgres + Redis and wait until healthy (creates .env from .env.example if missing)
+	@test -f .env || { cp .env.example .env; echo "created .env from .env.example (placeholder values)"; }
 	$(COMPOSE) up -d --wait postgres redis
 
 down: ## Stop and remove containers (volumes are kept)
@@ -67,6 +68,18 @@ bench: ## Throughput + chaos runs -> benchmarks/results.md (Docker; ~15 min, own
 	$(UV) run python -m benchmarks.run_throughput
 	$(UV) run python -m benchmarks.run_chaos --no-build
 	$(UV) run python -m benchmarks.report
+
+DEMO_COMPOSE := $(COMPOSE) -f docker-compose.yml -f demo/compose.demo.yml --profile app
+
+DEMO_LOG := $(or $(TMPDIR),/tmp/)wfe-demo-stack.log
+
+demo-stack: ## Build and start API + maintenance + 3 workers with demo leases (5 s)
+	@echo "building and starting the demo stack (API, maintenance, 3 workers)..."
+	@$(DEMO_COMPOSE) up -d --build --wait --scale worker=3 api maintenance worker \
+		>$(DEMO_LOG) 2>&1 || { cat $(DEMO_LOG); exit 1; }
+
+demo: demo-stack ## Submit jobs, SIGKILL a busy worker, watch the job recover (`make down` after)
+	@$(UV) run python -m demo.run
 
 k8s-up: ## kind cluster + image + manifests, then wait until every component is ready
 	@$(KIND) get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER) \
