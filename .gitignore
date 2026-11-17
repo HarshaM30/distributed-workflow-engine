@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local databases
+*.db
+*.sqlite3
+
+# Model caches (fastembed / ONNX downloads)
+.cache/
+models_cache/
+
+# Benchmark raw output (summaries live in benchmarks/results.md)
+benchmarks/raw/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
