@@ -162,32 +162,43 @@ distributed-workflow-engine/
 ### Milestone 1: Scaffold
 
 **Tasks**
-- [ ] `uv init` with Python 3.12 and a `src/` layout. Add runtime deps (fastapi, uvicorn,
+- [x] `uv init` with Python 3.12 and a `src/` layout. Add runtime deps (fastapi, uvicorn,
       sqlalchemy[asyncio], psycopg[binary], alembic, pydantic-settings, redis, structlog)
       and dev deps (pytest, pytest-asyncio, httpx, ruff, mypy).
-- [ ] Configure ruff (lint + format) and pytest markers (`unit`, `integration`, `chaos`) in
+- [x] Configure ruff (lint + format) and pytest markers (`unit`, `integration`, `chaos`) in
       `pyproject.toml`.
-- [ ] `config.py` with typed settings for every variable in `.env.example`.
-- [ ] SQLAlchemy models for all five tables, plus the `JobStatus` enum and transition table.
-- [ ] Alembic setup and an initial migration (including `CREATE EXTENSION vector`).
-- [ ] `docker-compose.yml`: `pgvector/pgvector:pg16` and `redis:7-alpine` with healthchecks,
+- [x] `config.py` with typed settings for every variable in `.env.example`.
+- [x] SQLAlchemy models for all five tables, plus the `JobStatus` enum and transition table.
+- [x] Alembic setup and an initial migration (including `CREATE EXTENSION vector`).
+- [x] `docker-compose.yml`: `pgvector/pgvector:pg16` and `redis:7-alpine` with healthchecks,
       named volumes, and memory limits. API/worker services go behind a profile.
-- [ ] Multi-stage `Dockerfile` (uv-based, non-root user, arm64- and amd64-compatible).
-- [ ] FastAPI app with `GET /health`, which checks Postgres and Redis and returns 200 or 503
+- [x] Multi-stage `Dockerfile` (uv-based, non-root user, arm64- and amd64-compatible).
+- [x] FastAPI app with `GET /health`, which checks Postgres and Redis and returns 200 or 503
       with details for each component.
-- [ ] `Makefile` targets: `install`, `up`, `down`, `migrate`, `api`, `worker`,
+- [x] `Makefile` targets: `install`, `up`, `down`, `migrate`, `api`, `worker`,
       `maintenance`, `lint`, `fmt`, `test-unit`, `test-integration`, `test-chaos`, `bench`.
-- [ ] GitHub Actions `ci.yml`, run on every push: ruff check + format check, then unit
+- [x] GitHub Actions `ci.yml`, run on every push: ruff check + format check, then unit
       tests, then integration tests against Postgres (pgvector image) and Redis service
       containers. Cache uv. Chaos tests and benchmarks are left out (see Milestone 5).
 
 **Done when**
-- [ ] `make up && make migrate` on a clean checkout creates all tables.
-- [ ] `curl localhost:8000/health` returns 200 with both components `ok`, and returns 503
+- [x] `make up && make migrate` on a clean checkout creates all tables.
+- [x] `curl localhost:8000/health` returns 200 with both components `ok`, and returns 503
       when Redis is stopped.
-- [ ] `alembic downgrade base && alembic upgrade head` round-trips cleanly.
-- [ ] `make lint` and `make test-unit` pass locally.
-- [ ] CI is green on the first push and runs all three stages.
+- [x] `alembic downgrade base && alembic upgrade head` round-trips cleanly.
+- [x] `make lint` and `make test-unit` pass locally.
+- [x] CI is green on the first push and runs all three stages.
+
+**Implementation notes**
+- Compose publishes Postgres on host port **5433** (`POSTGRES_PORT`) so it doesn't clash with
+  another local Postgres on 5432. `DATABASE_URL` is now optional: when empty, the URL is built
+  from the `POSTGRES_*` parts, so the password lives in one place.
+- The CI lint stage also runs `mypy --strict` (an adopted addition).
+- `make maintenance` runs a stub entrypoint until Milestone 3, and `make bench` exits with a
+  "not implemented" message until Milestone 5.
+- `WORKER_CONCURRENCY` defaults to 1 (one job at a time per process, matching the benchmark
+  unit). New settings: `MAX_PAYLOAD_BYTES` (Milestone 2 payload cap) and `STREAM_MAXLEN`
+  (approximate per-stream trim; the sweeper repairs anything trimmed).
 
 ### Milestone 2: Submission API, dispatch, and a basic worker
 
